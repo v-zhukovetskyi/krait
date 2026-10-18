@@ -1,4 +1,4 @@
-# GPU DNA Aligner (Research Prototype)
+# Krait (Research Prototype)
 
 > ⚠️ **Status: Active Research Prototype.**  
 > An experimental, cross-platform genomics alignment engine exploring how much dynamic programming throughput can be extracted from consumer and legacy hardware (CPU multi-threading + portable WebGPU compute).
@@ -107,4 +107,10 @@ The GPU actor maintains two completely isolated hardware transport slots. While 
 * **Profiling:** `perf`, `hotspot`
 
 ## License
-MIT
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
+
+* Free for academic, research, and open-source use (including open-source network services).
+* If you wish to use this software in proprietary/closed-source commercial products or network services (SaaS) without AGPLv3 copyleft obligations, custom commercial licenses are available upon request. 
+
+Contact: **Valentyn Zhukovetskyi** - [zukovetski@gmail.com](mailto:zukovetski@gmail.com)

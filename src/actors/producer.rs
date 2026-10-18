@@ -1,3 +1,21 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Krait: GPU-Accelerated DNA Sequence Aligner for short reads.
+// Copyright (C) 2026 Valentyn Zhukovetskyi <zukovetski@gmail.com>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://gnu.org/licenses/>.
+
 use std::sync::Arc;
 
 use bio::io::fasta;
@@ -8,7 +26,7 @@ use tokio::sync::mpsc;
 use crate::{
     actors::{
         gpu_actor::GpuBatch,
-        reader::{ReadChunk, open_flexible_reader},
+        reader::{ChunkType, ReadChunk, open_flexible_reader},
         writer::{CandidateMeta, MappedPair, MetaBatch, ReadMeta},
     },
     cli::Args,
@@ -250,6 +268,43 @@ pub fn load_reference(path: &str) -> ReferenceGenome {
     ReferenceGenome { seq, contigs }
 }
 
+const MIN_INSERT: usize = 100;
+const MAX_INSERT: usize = 800;
+
+// Возвращает (pos_left, pos_right, tlen, r1_is_left), если пара корректна
+fn check_proper_pair(
+    pos1: usize,
+    is_rev1: bool,
+    pos2: usize,
+    is_rev2: bool,
+) -> Option<(usize, usize, i32, bool)> {
+    // 1. Цепи обязаны быть противоположными
+    if is_rev1 == is_rev2 {
+        return None;
+    }
+
+    // В Illumina FR: рид на прямой цепи ВСЕГДА идет левее рида на обратной цепи!
+    let (left_pos, right_pos, r1_is_left) = if !is_rev1 && is_rev2 {
+        (pos1, pos2, true)
+    } else if is_rev1 && !is_rev2 {
+        (pos2, pos1, false)
+    } else {
+        return None;
+    };
+
+    if right_pos < left_pos {
+        return None;
+    }
+
+    let tlen = (right_pos + READ_LEN) - left_pos;
+
+    if (MIN_INSERT..=MAX_INSERT).contains(&tlen) {
+        Some((left_pos, right_pos, tlen as i32, r1_is_left))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct Contig {
     pub name: String,
@@ -261,7 +316,7 @@ use rayon::prelude::*; // Обязательно подключаем трейт
 pub fn producer_task(
     args: Args,
     genome: Arc<ReferenceGenome>,
-    mut chunk_rx: mpsc::Receiver<ReadChunk>,
+    mut chunk_rx: mpsc::Receiver<ChunkType>,
     gpu_tx: mpsc::Sender<GpuBatch>,
     meta_tx: mpsc::Sender<MetaBatch>,
 ) -> tokio::task::JoinHandle<()> {
