@@ -47,7 +47,7 @@ pub struct SingleOffsets {
 // Единый буфер батча
 pub struct SingleChunkBuffer {
     pub data: Vec<u8>,
-    pub pairs: Vec<SingleOffsets>,
+    pub single: Vec<SingleOffsets>,
 }
 
 // Легковесная структура координат для пары ридов
@@ -65,7 +65,7 @@ pub struct PairChunkBuffer {
     pub pairs: Vec<PairOffsets>,
 }
 
-pub enum ChunkType {
+pub enum ChunkBuffer {
     Single(SingleChunkBuffer),
     Paired(PairChunkBuffer),
 }
@@ -154,7 +154,7 @@ pub fn reader_task(
     path1: String,
     path2: Option<String>,
     batch_size: usize,
-    chunk_tx: mpsc::Sender<ChunkType>,
+    chunk_tx: mpsc::Sender<ChunkBuffer>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut r1: BufReader<Box<dyn Read + Send>> = open_flexible_reader(&path1);
@@ -262,7 +262,7 @@ pub fn reader_task(
                     // Подменяем заполненный чанк новым, у которого емкость выставлена ИДЕАЛЬНО
                     let full_chunk = std::mem::replace(&mut current_chunk, make_new_chunk());
                     if chunk_tx
-                        .blocking_send(ChunkType::Paired(full_chunk))
+                        .blocking_send(ChunkBuffer::Paired(full_chunk))
                         .is_err()
                     {
                         break;
@@ -270,7 +270,7 @@ pub fn reader_task(
                 }
             }
             if !current_chunk.pairs.is_empty() {
-                let _ = chunk_tx.blocking_send(ChunkType::Paired(current_chunk));
+                let _ = chunk_tx.blocking_send(ChunkBuffer::Paired(current_chunk));
             }
         } else {
             println!("📦 [Reader] Режим: Single-End...");
@@ -281,13 +281,13 @@ pub fn reader_task(
             // Создаем первый чанк и сразу копируем туда данные первого рида, которые мы уже считали
             let mut current_chunk = SingleChunkBuffer {
                 data: Vec::with_capacity(data_capacity),
-                pairs: Vec::with_capacity(batch_size),
+                single: Vec::with_capacity(batch_size),
             };
 
             // Переносим байты первого рида в основной буфер
             current_chunk.data.extend_from_slice(&first_r1_bytes);
 
-            current_chunk.pairs.push(SingleOffsets {
+            current_chunk.single.push(SingleOffsets {
                 name: r1_name,
                 seq: r1_seq,
                 qual: r1_qual,
@@ -296,7 +296,7 @@ pub fn reader_task(
             // Переиспользуемая функция/замыкание для создания нового чанка с точно рассчитанной емкостью
             let make_new_chunk = || SingleChunkBuffer {
                 data: Vec::with_capacity(data_capacity),
-                pairs: Vec::with_capacity(batch_size),
+                single: Vec::with_capacity(batch_size),
             };
 
             loop {
@@ -313,25 +313,25 @@ pub fn reader_task(
                 let qual1_range = read_seq(&mut r1, &mut current_chunk.data);
 
                 // Записываем точечные координаты (убирая служебные \n и символы @ / + при желании)
-                current_chunk.pairs.push(SingleOffsets {
+                current_chunk.single.push(SingleOffsets {
                     name: name_range,
                     seq: seq1_range,
                     qual: qual1_range,
                 });
 
-                if current_chunk.pairs.len() == batch_size {
+                if current_chunk.single.len() == batch_size {
                     // Подменяем заполненный чанк новым, у которого емкость выставлена ИДЕАЛЬНО
                     let full_chunk = std::mem::replace(&mut current_chunk, make_new_chunk());
                     if chunk_tx
-                        .blocking_send(ChunkType::Single(full_chunk))
+                        .blocking_send(ChunkBuffer::Single(full_chunk))
                         .is_err()
                     {
                         break;
                     }
                 }
             }
-            if !current_chunk.pairs.is_empty() {
-                let _ = chunk_tx.blocking_send(ChunkType::Single(current_chunk));
+            if !current_chunk.single.is_empty() {
+                let _ = chunk_tx.blocking_send(ChunkBuffer::Single(current_chunk));
             }
         }
     })

@@ -18,27 +18,130 @@
 
 use bytemuck::{Pod, Zeroable};
 use tokio::sync::mpsc;
-use wgpu::PipelineCompilationOptions;
+use wgpu::{ComputePipeline, Device, PipelineCompilationOptions, Queue};
 
 use crate::{
-    actors::writer::ScoreBatch,
+    actors::{
+        producer::{GpuBatch, PairedGpuBatch, PairedMeta, SingleGpuBatch},
+        writer::ScoreBatch,
+    },
     cli::Args,
     constants::{
         CIGAR_CAPACITY, N_MASK_WORDS, READ_LEN, READ_WORDS, REF_LEN, REF_WORDS, REF_WORDS_4BIT,
         SCORES_PER_READ,
     },
 };
-// Подставьте ваши импорты Args, GpuBatch, ScoreBatch, PipelineCompilationOptions и wgpu
-pub struct GpuBatch {
-    pub id: usize,
-    pub packed_a: Vec<u32>,
-    pub packed_b: Vec<u32>,
-    pub mask_n_a: Vec<u32>,
-    pub mask_n_b: Vec<u32>,
-    pub group_info: Vec<u32>, // <--- НОВОЕ: 1 число на кандидата (200 КБ)
-    pub valid_reads: usize,
+struct GPU {
+    device: Device,
+    queue: Queue,
+    dp_pipeline: ComputePipeline,
+    tb_pipeline: ComputePipeline,
+    slots: [GpuSlot; 2],
 }
+// Подставьте ваши импорты Args, GpuBatch, ScoreBatch, PipelineCompilationOptions и wgp
+async fn init_gpu(args: &Args) -> GPU {
+    let instance = wgpu::Instance::default();
 
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        })
+        .await
+        .unwrap_or_else(|_| panic!("❌ Не удалось найти видеокарту!"));
+
+    let info = adapter.get_info();
+    println!("🚀 Используемый GPU: [{:?}] {}", info.backend, info.name);
+
+    // Запрашиваем максимальные лимиты, доступные на адаптере
+    let limits = adapter.limits();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            required_limits: wgpu::Limits {
+                max_storage_buffer_binding_size: (args.batch_size * READ_LEN * 16 * 4 * 2) as u64,
+                max_buffer_size: (args.batch_size * READ_LEN * 16 * 4 * 2) as u64,
+                ..limits
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. Компиляция ДВУХ раздельных шейдеров
+    let dp_shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/dp_kernel.wgsl"));
+    let dp_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("dp_pipeline"),
+        layout: None,
+        module: &dp_shader,
+        entry_point: Some("main"),
+        compilation_options: PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    let tb_shader =
+        device.create_shader_module(wgpu::include_wgsl!("../shaders/traceback_kernel.wgsl"));
+    let tb_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("traceback_pipeline"),
+        layout: None,
+        module: &tb_shader,
+        entry_point: Some("main"),
+        compilation_options: PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    let dp_layout = dp_pipeline.get_bind_group_layout(0);
+    let tb_layout = tb_pipeline.get_bind_group_layout(0);
+
+    // Общий буфер параметров
+    let buffer_params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("params_uniform"),
+        size: std::mem::size_of::<GpuParams>() as wgpu::BufferAddress,
+        mapped_at_creation: false,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let default_params = GpuParams {
+        read_len: u32::try_from(READ_LEN).unwrap(),
+        ref_len: u32::try_from(REF_LEN).unwrap(),
+        match_score: 3,
+        mismatch_penalty: -3,
+        gap_open: -6,
+        gap_extend: -1,
+        z_drop: 100,
+        batch_size: u32::try_from(args.batch_size).unwrap(),
+    };
+    queue.write_buffer(&buffer_params, 0, bytemuck::bytes_of(&default_params));
+
+    // 2. Создаем ДВА слота (Double-Buffering)
+    let slots: [GpuSlot; 2] = [
+        create_slot(
+            &device,
+            args.batch_size,
+            &buffer_params,
+            &dp_layout,
+            &tb_layout,
+            0,
+        ),
+        create_slot(
+            &device,
+            args.batch_size,
+            &buffer_params,
+            &dp_layout,
+            &tb_layout,
+            1,
+        ),
+    ];
+
+    GPU {
+        device,
+        queue,
+        dp_pipeline,
+        tb_pipeline,
+        slots,
+    }
+}
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct GpuParams {
@@ -234,7 +337,6 @@ fn create_slot(
     }
 }
 
-// Данные, находящиеся в процессе вычислений на GPU
 struct InFlight {
     sub_idx: wgpu::SubmissionIndex,
     rx_score: tokio::sync::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
@@ -243,547 +345,397 @@ struct InFlight {
     slot_idx: usize,
 }
 
-pub async fn gpu_actor(
-    args: Args,
-    mut rx: mpsc::Receiver<GpuBatch>,
-    score_tx: mpsc::Sender<ScoreBatch>,
-) {
-    let instance = wgpu::Instance::default();
-
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            apply_limit_buckets: false,
-        })
-        .await
-        .unwrap_or_else(|_| panic!("❌ Не удалось найти видеокарту!"));
-
-    let info = adapter.get_info();
-    println!("🚀 Используемый GPU: [{:?}] {}", info.backend, info.name);
-
-    // Запрашиваем максимальные лимиты, доступные на адаптере
-    let limits = adapter.limits();
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            required_limits: wgpu::Limits {
-                max_storage_buffer_binding_size: (args.batch_size * READ_LEN * 16 * 4 * 2) as u64,
-                max_buffer_size: (args.batch_size * READ_LEN * 16 * 4 * 2) as u64,
-                ..limits
-            },
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    // 1. Компиляция ДВУХ раздельных шейдеров
-    let dp_shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/dp_kernel.wgsl"));
-    let dp_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("dp_pipeline"),
-        layout: None,
-        module: &dp_shader,
-        entry_point: Some("main"),
-        compilation_options: PipelineCompilationOptions::default(),
-        cache: None,
-    });
-
-    let tb_shader =
-        device.create_shader_module(wgpu::include_wgsl!("../shaders/traceback_kernel.wgsl"));
-    let tb_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("traceback_pipeline"),
-        layout: None,
-        module: &tb_shader,
-        entry_point: Some("main"),
-        compilation_options: PipelineCompilationOptions::default(),
-        cache: None,
-    });
-
-    let dp_layout = dp_pipeline.get_bind_group_layout(0);
-    let tb_layout = tb_pipeline.get_bind_group_layout(0);
-
-    // Общий буфер параметров
-    let buffer_params = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("params_uniform"),
-        size: std::mem::size_of::<GpuParams>() as wgpu::BufferAddress,
-        mapped_at_creation: false,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-
-    let default_params = GpuParams {
-        read_len: u32::try_from(READ_LEN).unwrap(),
-        ref_len: u32::try_from(REF_LEN).unwrap(),
-        match_score: 3,
-        mismatch_penalty: -3,
-        gap_open: -6,
-        gap_extend: -1,
-        z_drop: 100,
-        batch_size: u32::try_from(args.batch_size).unwrap(),
+async fn copy_and_send_data(
+    gpu: &GPU,
+    in_flight: &mut Option<InFlight>,
+    count: &std::ops::Range<usize>,
+) -> Option<ScoreBatch> {
+    let prev = match in_flight.take() {
+        Some(p) => p,
+        None => return None,
     };
-    queue.write_buffer(&buffer_params, 0, bytemuck::bytes_of(&default_params));
 
-    // 2. Создаем ДВА слота (Double-Buffering)
-    let slots = [
-        create_slot(
-            &device,
-            args.batch_size,
-            &buffer_params,
-            &dp_layout,
-            &tb_layout,
-            0,
-        ),
-        create_slot(
-            &device,
-            args.batch_size,
-            &buffer_params,
-            &dp_layout,
-            &tb_layout,
-            1,
-        ),
-    ];
-
-    let mut slot_idx = 0;
-    let mut in_flight: Option<InFlight> = None;
-
-    while let Some(batch) = rx.recv().await {
-        let slot = &slots[slot_idx];
-
-        // Асинхронно заливаем данные в текущий слот
-        queue.write_buffer(&slot.buffer_a, 0, bytemuck::cast_slice(&batch.packed_a));
-        queue.write_buffer(&slot.buffer_b, 0, bytemuck::cast_slice(&batch.packed_b));
-        queue.write_buffer(
-            &slot.buffer_mask_n_a,
-            0,
-            bytemuck::cast_slice(&batch.mask_n_a),
-        );
-        queue.write_buffer(
-            &slot.buffer_mask_n_b,
-            0,
-            bytemuck::cast_slice(&batch.mask_n_b),
-        );
-        queue.write_buffer(
-            &slot.buffer_group_info,
-            0,
-            bytemuck::cast_slice(&batch.group_info),
-        );
-
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        const WORKGROUP_SIZE: u32 = 64;
-        let workgroups = (batch.valid_reads as f32 / WORKGROUP_SIZE as f32).ceil() as u32;
-
-        // ПАСС 1: DP (Матрица Гото)
-        {
-            let mut cpass1 = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("DP_Pass"),
-                timestamp_writes: None,
-            });
-            cpass1.set_pipeline(&dp_pipeline);
-            cpass1.set_bind_group(0, &slot.bind_group_dp, &[]);
-            cpass1.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        // ПАСС 2: Traceback (Драйвер GPU автоматически ставит барьер памяти между пассами)
-        {
-            let mut cpass2 = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("TB_Pass"),
-                timestamp_writes: None,
-            });
-            cpass2.set_pipeline(&tb_pipeline);
-            cpass2.set_bind_group(0, &slot.bind_group_tb, &[]);
-            cpass2.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        let copy_scores_size = (batch.valid_reads * SCORES_PER_READ * 4) as wgpu::BufferAddress;
-        let copy_cigar_size = (batch.valid_reads * CIGAR_CAPACITY * 4) as wgpu::BufferAddress;
-
-        encoder.copy_buffer_to_buffer(
-            &slot.buffer_scores,
-            0,
-            &slot.staging_scores,
-            0,
-            copy_scores_size,
-        );
-        encoder.copy_buffer_to_buffer(
-            &slot.buffer_cigar,
-            0,
-            &slot.staging_cigar,
-            0,
-            copy_cigar_size,
-        );
-
-        // Отправляем оба пасса на исполнение одной транзакцией
-        let sub_idx = queue.submit(Some(encoder.finish()));
-
-        // Регистрируем async-чтение для текущего слота
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-
-        slot.staging_scores
-            .slice(..copy_scores_size)
-            .map_async(wgpu::MapMode::Read, move |v| {
-                let _ = tx1.send(v);
-            });
-        slot.staging_cigar
-            .slice(..copy_cigar_size)
-            .map_async(wgpu::MapMode::Read, move |v| {
-                let _ = tx2.send(v);
-            });
-
-        // Если есть батч, который GPU считал на ПРОШЛОМ шаге — забираем его
-        if let Some(prev) = in_flight.take() {
-            // Ждем ТОЛЬКО завершения предыдущей отправки (не блокируя текущую!)
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(prev.sub_idx),
-                    timeout: None,
-                })
-                .unwrap();
-
-            if prev.rx_score.await.is_ok() && prev.rx_cigar.await.is_ok() {
-                let prev_slot = &slots[prev.slot_idx];
-                let prev_scores_size =
-                    (prev.valid_reads * SCORES_PER_READ * 4) as wgpu::BufferAddress;
-                let prev_cigar_size =
-                    (prev.valid_reads * CIGAR_CAPACITY * 4) as wgpu::BufferAddress;
-
-                let data_score = prev_slot
-                    .staging_scores
-                    .slice(..prev_scores_size)
-                    .get_mapped_range()
-                    .unwrap();
-                let data_cigar = prev_slot
-                    .staging_cigar
-                    .slice(..prev_cigar_size)
-                    .get_mapped_range()
-                    .unwrap();
-
-                if score_tx
-                    .send(ScoreBatch {
-                        scores_and_coords: bytemuck::cast_slice(&data_score).to_vec(),
-                        cigar_bin: bytemuck::cast_slice(&data_cigar).to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-
-                drop(data_score);
-                drop(data_cigar);
-                prev_slot.staging_scores.unmap();
-                prev_slot.staging_cigar.unmap();
-            }
-        }
-
-        // Запоминаем текущий батч как in_flight
-        in_flight = Some(InFlight {
-            sub_idx,
-            rx_score: rx1,
-            rx_cigar: rx2,
-            valid_reads: batch.valid_reads,
-            slot_idx,
-        });
-
-        // Переключаем слот (0 -> 1 -> 0 -> 1)
-        slot_idx = 1 - slot_idx;
-    }
-
-    // Хвостовой батч (забираем самый последний результат после завершения цикла)
-    if let Some(prev) = in_flight.take() {
-        device
+    // ОПТИМИЗАЦИЯ 1: Не блокируем весь асинхронный рантайм Tokio.
+    // Выносим тяжелое ожидание GPU в block_in_place, чтобы Tokio переключил другие задачи на соседние потоки.
+    tokio::task::block_in_place(|| {
+        gpu.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(prev.sub_idx),
                 timeout: None,
             })
             .unwrap();
+    });
 
-        if prev.rx_score.await.is_ok() && prev.rx_cigar.await.is_ok() {
-            let prev_slot = &slots[prev.slot_idx];
-            let prev_scores_size = (prev.valid_reads * SCORES_PER_READ * 4) as wgpu::BufferAddress;
-            let prev_cigar_size = (prev.valid_reads * CIGAR_CAPACITY * 4) as wgpu::BufferAddress;
-
-            let data_score = prev_slot
-                .staging_scores
-                .slice(..prev_scores_size)
-                .get_mapped_range()
-                .unwrap();
-            let data_cigar = prev_slot
-                .staging_cigar
-                .slice(..prev_cigar_size)
-                .get_mapped_range()
-                .unwrap();
-
-            let _ = score_tx
-                .send(ScoreBatch {
-                    scores_and_coords: bytemuck::cast_slice(&data_score).to_vec(),
-                    cigar_bin: bytemuck::cast_slice(&data_cigar).to_vec(),
-                })
-                .await;
-
-            drop(data_score);
-            drop(data_cigar);
-            prev_slot.staging_scores.unmap();
-            prev_slot.staging_cigar.unmap();
-        }
+    // Ожидаем коллбеки от маппинга wgpu
+    if prev.rx_score.await.is_err() || prev.rx_cigar.await.is_err() {
+        return None; // Или false, в зависимости от того, критична ли эта ошибка для цикла
     }
+
+    let prev_slot = &gpu.slots[prev.slot_idx];
+    let prev_scores_size = (prev.valid_reads * SCORES_PER_READ * 4) as wgpu::BufferAddress;
+    let prev_cigar_size = (prev.valid_reads * CIGAR_CAPACITY * 4) as wgpu::BufferAddress;
+
+    let mut result = None;
+
+    // Ссылки на данные получаем в ограниченной области видимости
+    let _ = {
+        let data_score = prev_slot
+            .staging_scores
+            .slice(..prev_scores_size)
+            .get_mapped_range();
+        let data_cigar = prev_slot
+            .staging_cigar
+            .slice(..prev_cigar_size)
+            .get_mapped_range();
+
+        let (data_score, data_cigar) = match (data_score, data_cigar) {
+            (Ok(s), Ok(c)) => (s, c),
+            _ => {
+                // Если маппинг не удался, обязательно размапливаем перед выходом
+                prev_slot.staging_scores.unmap();
+                prev_slot.staging_cigar.unmap();
+                return None;
+            }
+        };
+
+        // ОПТИМИЗАЦИЯ 2: Аллокация (.to_vec()) происходит ДО отправки.
+        // Мы сразу освобождаем GPU буферы, чтобы сделать unmap() как можно раньше,
+        // не дожидаясь пока `.send().await` разблокируется (если канал был полон).
+        result = Some(ScoreBatch {
+            count: count.clone(),
+            scores_and_coords: bytemuck::cast_slice(&data_score).to_vec(),
+            cigar_bin: bytemuck::cast_slice(&data_cigar).to_vec(),
+        });
+        // Здесь data_score и data_cigar автоматически дропаются (выходят из scope)
+    };
+
+    // ИСПРАВЛЕНИЕ БАГА: Размещаем unmap ДО отправки в канал.
+    // Теперь, если канал заблокирован (канал заполнен) или закрыт, буферы GPU уже свободны для следующего кадра!
+    prev_slot.staging_scores.unmap();
+    prev_slot.staging_cigar.unmap();
+
+    result
 }
 
-// async fn gpu_actor(
-//     args: Args,
-//     mut rx: mpsc::Receiver<GpuBatch>,
-//     score_tx: mpsc::Sender<ScoreBatch>,
-// ) {
-//     let instance = wgpu::Instance::default();
+async fn send_task(
+    gpu: &GPU,
+    slot_idx: &mut usize,
+    count: &std::ops::Range<usize>,
+    soa_packed_a: &Vec<u32>,
+    soa_packed_b: &Vec<u32>,
+    soa_mask_n_a: &Vec<u32>,
+    soa_mask_n_b: &Vec<u32>,
+    soa_group_info: &Vec<u32>,
+    in_flight: &mut Option<InFlight>,
+) -> (Option<ScoreBatch>, Option<ScoreBatch>) {
+    let slot = &gpu.slots[*slot_idx];
 
-//     let adapter = instance
-//         .request_adapter(&wgpu::RequestAdapterOptions {
-//             power_preference: wgpu::PowerPreference::HighPerformance,
-//             force_fallback_adapter: false,
-//             compatible_surface: None,
-//             apply_limit_buckets: false,
-//         })
-//         .await
-//         .unwrap_or_else(|_| panic!("❌ Не удалось найти дискретную видеокарту!"));
+    // Асинхронно заливаем данные в текущий слот
+    gpu.queue
+        .write_buffer(&slot.buffer_a, 0, bytemuck::cast_slice(&soa_packed_a));
 
-//     let info = adapter.get_info();
-//     println!("🚀 Используемый GPU: [{:?}] {}", info.backend, info.name);
+    gpu.queue
+        .write_buffer(&slot.buffer_b, 0, bytemuck::cast_slice(&soa_packed_b));
 
-//     let (device, queue) = adapter
-//         .request_device(&wgpu::DeviceDescriptor {
-//             required_limits: wgpu::Limits {
-//                 max_storage_buffer_binding_size: 1024 * 1024 * 1024,
-//                 max_buffer_size: 1024 * 1024 * 1024,
-//                 ..adapter.limits()
-//             },
-//             ..Default::default()
-//         })
-//         .await
-//         .unwrap();
+    gpu.queue.write_buffer(
+        &slot.buffer_mask_n_a,
+        0,
+        bytemuck::cast_slice(&soa_mask_n_a),
+    );
 
-//     let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-//     let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-//         label: None,
-//         layout: None,
-//         module: &shader,
-//         entry_point: Some("main"),
-//         compilation_options: PipelineCompilationOptions::default(),
-//         cache: None,
-//     });
+    gpu.queue.write_buffer(
+        &slot.buffer_mask_n_b,
+        0,
+        bytemuck::cast_slice(&soa_mask_n_b),
+    );
 
-//     // --- РАСЧЕТ РАЗМЕРОВ БУФЕРОВ ---
-//     let buffer_a_size = (args.batch_size * REF_WORDS * 4) as wgpu::BufferAddress;
-//     let buffer_b_size = (args.batch_size * READ_WORDS * 4) as wgpu::BufferAddress;
-//     let mask_n_a_size = (args.batch_size * N_MASK_WORDS * 4) as wgpu::BufferAddress;
-//     let mask_n_b_size = (args.batch_size * N_MASK_WORDS * 4) as wgpu::BufferAddress;
-//     let scores_size = (args.batch_size * SCORES_PER_READ * 4) as wgpu::BufferAddress;
-//     let dirs_size = (args.batch_size * READ_LEN * REF_WORDS_4BIT * 4) as wgpu::BufferAddress;
-//     let cigar_size = (args.batch_size * CIGAR_CAPACITY * 4) as wgpu::BufferAddress;
-//     let params_size = std::mem::size_of::<GpuParams>() as wgpu::BufferAddress;
+    gpu.queue.write_buffer(
+        &slot.buffer_group_info,
+        0,
+        bytemuck::cast_slice(&soa_group_info),
+    );
 
-//     // --- СОЗДАНИЕ STORAGE И UNIFORM БУФЕРОВ НА GPU ---
-//     let buffer_a = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("seqs_a"),
-//         size: buffer_a_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-//     });
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-//     let buffer_b = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("seqs_b"),
-//         size: buffer_b_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-//     });
+    const WORKGROUP_SIZE: u32 = 64;
+    let workgroups = (count.len() as f32 / WORKGROUP_SIZE as f32).ceil() as u32;
 
-//     let buffer_mask_n_a = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("mask_n_a"),
-//         size: mask_n_a_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-//     });
+    // ПАСС 1: DP (Матрица Гото)
+    {
+        let mut cpass1 = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("DP_Pass"),
+            timestamp_writes: None,
+        });
+        cpass1.set_pipeline(&gpu.dp_pipeline);
+        cpass1.set_bind_group(0, &slot.bind_group_dp, &[]);
+        cpass1.dispatch_workgroups(workgroups, 1, 1);
+    }
 
-//     let buffer_mask_n_b = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("mask_n_b"),
-//         size: mask_n_b_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-//     });
+    // ПАСС 2: Traceback (Драйвер GPU автоматически ставит барьер памяти между пассами)
+    {
+        let mut cpass2 = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("TB_Pass"),
+            timestamp_writes: None,
+        });
+        cpass2.set_pipeline(&gpu.tb_pipeline);
+        cpass2.set_bind_group(0, &slot.bind_group_tb, &[]);
+        cpass2.dispatch_workgroups(workgroups, 1, 1);
+    }
 
-//     let buffer_scores = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("scores_out"),
-//         size: scores_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-//     });
+    let copy_scores_size = (count.len() * SCORES_PER_READ * 4) as wgpu::BufferAddress;
+    let copy_cigar_size = (count.len() * CIGAR_CAPACITY * 4) as wgpu::BufferAddress;
 
-//     let buffer_dirs = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("directions"),
-//         size: dirs_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::STORAGE,
-//     });
+    encoder.copy_buffer_to_buffer(
+        &slot.buffer_scores,
+        0,
+        &slot.staging_scores,
+        0,
+        copy_scores_size,
+    );
+    encoder.copy_buffer_to_buffer(
+        &slot.buffer_cigar,
+        0,
+        &slot.staging_cigar,
+        0,
+        copy_cigar_size,
+    );
 
-//     let buffer_cigar = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("cigar_out"),
-//         size: cigar_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-//     });
+    // Отправляем оба пасса на исполнение одной транзакцией
+    let sub_idx = gpu.queue.submit(Some(encoder.finish()));
 
-//     let buffer_params = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("params_uniform"),
-//         size: params_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-//     });
+    // Регистрируем async-чтение для текущего слота
+    let (tx1, rx1) = tokio::sync::oneshot::channel();
+    let (tx2, rx2) = tokio::sync::oneshot::channel();
 
-//     // --- STAGING БУФЕРЫ ДЛЯ ЧТЕНИЯ НА CPU ---
-//     let staging_scores = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("staging_scores"),
-//         size: scores_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-//     });
+    slot.staging_scores
+        .slice(..copy_scores_size)
+        .map_async(wgpu::MapMode::Read, move |v| {
+            let _ = tx1.send(v);
+        });
+    slot.staging_cigar
+        .slice(..copy_cigar_size)
+        .map_async(wgpu::MapMode::Read, move |v| {
+            let _ = tx2.send(v);
+        });
 
-//     let staging_cigar = device.create_buffer(&wgpu::BufferDescriptor {
-//         label: Some("staging_cigar"),
-//         size: cigar_size,
-//         mapped_at_creation: false,
-//         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-//     });
+    // Если есть батч, который GPU считал на ПРОШЛОМ шаге — забираем его
+    let result1 = copy_and_send_data(gpu, in_flight, count).await;
 
-//     // Инициализируем параметры по умолчанию
-//     let default_params = GpuParams {
-//         read_len: u32::try_from(READ_LEN).unwrap(),
-//         ref_len: u32::try_from(REF_LEN).unwrap(),
-//         match_score: 3,
-//         mismatch_penalty: -3,
-//         gap_open: -6,
-//         gap_extend: -1,
-//         z_drop: 100,
-//         batch_size: u32::try_from(args.batch_size).unwrap(),
-//     };
-//     queue.write_buffer(&buffer_params, 0, bytemuck::bytes_of(&default_params));
+    // Запоминаем текущий батч как in_flight
+    *in_flight = Some(InFlight {
+        sub_idx,
+        rx_score: rx1,
+        rx_cigar: rx2,
+        valid_reads: count.len(),
+        slot_idx: *slot_idx,
+    });
 
-//     // На случай, если в батче пока нет N-масок — создаем буфер нулей
-//     let zero_n_masks = vec![0u32; args.batch_size * N_MASK_WORDS];
-//     queue.write_buffer(&buffer_mask_n_a, 0, bytemuck::cast_slice(&zero_n_masks));
-//     queue.write_buffer(&buffer_mask_n_b, 0, bytemuck::cast_slice(&zero_n_masks));
+    // Переключаем слот (0 -> 1 -> 0 -> 1)
+    *slot_idx = 1 - *slot_idx;
 
-//     let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+    // Хвостовой батч (забираем самый последний результат после завершения цикла)
+    let result2 = copy_and_send_data(gpu, in_flight, count).await;
+    (result1, result2)
+}
+// Данные, находящиеся в процессе вычислений на GPU
+struct SingleWriteButch {
+    pub data: SingleGpuBatch,
+    pub gpu_result: Vec<ScoreBatch>,
+}
+struct PairedWriteButch {
+    pub data: PairedGpuBatch,
+    pub gpu_result: Vec<ScoreBatch>,
+}
 
-//     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-//         label: Some("main_bind_group"),
-//         layout: &bind_group_layout,
-//         entries: &[
-//             wgpu::BindGroupEntry {
-//                 binding: 0,
-//                 resource: buffer_a.as_entire_binding(),
-//             },
-//             wgpu::BindGroupEntry {
-//                 binding: 1,
-//                 resource: buffer_b.as_entire_binding(),
-//             },
-//             wgpu::BindGroupEntry {
-//                 binding: 2,
-//                 resource: buffer_mask_n_a.as_entire_binding(),
-//             },
-//             wgpu::BindGroupEntry {
-//                 binding: 3,
-//                 resource: buffer_mask_n_b.as_entire_binding(),
-//             },
-//             wgpu::BindGroupEntry {
-//                 binding: 4,
-//                 resource: buffer_scores.as_entire_binding(),
-//             },
-//             wgpu::BindGroupEntry {
-//                 binding: 5,
-//                 resource: buffer_dirs.as_entire_binding(),
-//             },
-//             wgpu::BindGroupEntry {
-//                 binding: 6,
-//                 resource: buffer_cigar.as_entire_binding(),
-//             },
-//             wgpu::BindGroupEntry {
-//                 binding: 7,
-//                 resource: buffer_params.as_entire_binding(),
-//             },
-//         ],
-//     });
+enum WriteButch {
+    Single(SingleWriteButch),
+    Paired(PairedWriteButch),
+}
+pub async fn gpu_actor(
+    args: Args,
+    mut rx: mpsc::Receiver<GpuBatch>,
+    score_tx: mpsc::Sender<WriteButch>,
+) {
+    let gpu = init_gpu(&args).await;
 
-//     while let Some(batch) = rx.recv().await {
-//         queue.write_buffer(&buffer_a, 0, bytemuck::cast_slice(&batch.packed_a));
-//         queue.write_buffer(&buffer_b, 0, bytemuck::cast_slice(&batch.packed_b));
+    let mut slot_idx = 0;
+    let mut in_flight: Option<InFlight> = None;
 
-//         // Если вы добавили поля mask_n_a/mask_n_b в GpuBatch, раскомментируйте:
-//         queue.write_buffer(&buffer_mask_n_a, 0, bytemuck::cast_slice(&batch.mask_n_a));
-//         queue.write_buffer(&buffer_mask_n_b, 0, bytemuck::cast_slice(&batch.mask_n_b));
+    let mut soa_packed_a = Vec::with_capacity(args.batch_size * REF_WORDS);
+    let mut soa_packed_b = Vec::with_capacity(args.batch_size * READ_WORDS);
+    let mut soa_mask_n_a = Vec::with_capacity(args.batch_size * N_MASK_WORDS);
+    let mut soa_mask_n_b = Vec::with_capacity(args.batch_size * N_MASK_WORDS);
+    let mut soa_group_info = Vec::with_capacity(args.batch_size);
 
-//         let mut encoder =
-//             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-//         {
-//             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-//                 label: None,
-//                 timestamp_writes: None,
-//             });
+    while let Some(batch) = rx.recv().await {
+        let mut count: usize = 0;
+        let mut prev_count: usize = 0;
 
-//             cpass.set_pipeline(&compute_pipeline);
-//             cpass.set_bind_group(0, &bind_group, &[]);
-//             cpass.dispatch_workgroups((batch.valid_reads as f32 / 64.0).ceil() as u32, 1, 1);
-//         }
+        // Вспомогательное микро-замыкание: кладет ОДНУ готовую задачу в SoA-колонки
+        macro_rules! push_task {
+            ($task:expr, $group_info:expr) => {
+                // 1. Раскладываем по колонкам SoA для идеального коалесцинга памяти на GPU:
+                for (w, offset) in (0..REF_WORDS).zip((0..).step_by(args.batch_size)) {
+                    soa_packed_a[offset + count] = $task.packed_ref[w];
+                }
 
-//         // Копируем точный объем данных валидных ридов
-//         let copy_scores_size = (batch.valid_reads * SCORES_PER_READ * 4) as wgpu::BufferAddress;
-//         let copy_cigar_size = (batch.valid_reads * CIGAR_CAPACITY * 4) as wgpu::BufferAddress;
+                // Для soa_packed_b (размер READ_WORDS)
+                for (w, offset) in (0..READ_WORDS).zip((0..).step_by(args.batch_size)) {
+                    soa_packed_b[offset + count] = $task.packed_read[w];
+                }
 
-//         encoder.copy_buffer_to_buffer(&buffer_scores, 0, &staging_scores, 0, copy_scores_size);
-//         encoder.copy_buffer_to_buffer(&buffer_cigar, 0, &staging_cigar, 0, copy_cigar_size);
+                // Для soa_mask_n_a (размер N_MASK_WORDS)
+                for (w, offset) in (0..N_MASK_WORDS).zip((0..).step_by(args.batch_size)) {
+                    soa_mask_n_a[offset + count] = $task.mask_n_ref[w];
+                }
 
-//         queue.submit(Some(encoder.finish()));
+                // Для soa_mask_n_b (размер N_MASK_WORDS)
+                for (w, offset) in (0..N_MASK_WORDS).zip((0..).step_by(args.batch_size)) {
+                    soa_mask_n_b[offset + count] = $task.mask_n_read[w];
+                }
 
-//         let (tx1, rx1) = tokio::sync::oneshot::channel();
-//         let (tx2, rx2) = tokio::sync::oneshot::channel();
+                soa_group_info[count] = $group_info;
+                }
+            }
 
-//         staging_scores
-//             .slice(..copy_scores_size)
-//             .map_async(wgpu::MapMode::Read, move |v| {
-//                 tx1.send(v).unwrap();
-//             });
+        // А ТЕПЕРЬ MATCH СТАНОВИТСЯ НАМНОГО ЧИЩЕ (не нужно писать &mut count и звёздочки):
+        let mut result: Vec<ScoreBatch> = Vec::new();
 
-//         staging_cigar
-//             .slice(..copy_cigar_size)
-//             .map_async(wgpu::MapMode::Read, move |v| {
-//                 tx2.send(v).unwrap();
-//             });
+        match batch {
+            GpuBatch::Single(chunk) => {
+                while count < chunk.single.len() {
+                    let current_id = chunk.single[count].meta.id;
+                    let mut j = count + 1;
 
-//         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                    while j < chunk.single.len() && chunk.single[j].meta.id == current_id {
+                        j += 1;
+                    }
 
-//         if rx1.await.is_ok() && rx2.await.is_ok() {
-//             let data_score = staging_scores
-//                 .slice(..copy_scores_size)
-//                 .get_mapped_range()
-//                 .unwrap();
+                    if j >= args.batch_size {
+                        let batch_tuple = send_task(
+                            &gpu,
+                            &mut slot_idx,
+                            &(prev_count..count),
+                            &soa_packed_a,
+                            &soa_packed_b,
+                            &soa_mask_n_a,
+                            &soa_mask_n_b,
+                            &soa_group_info,
+                            &mut in_flight,
+                        )
+                        .await; // Здесь мы вышли из async-контекста и получили (Option, Option)
 
-//             let data_cigar = staging_cigar
-//                 .slice(..copy_cigar_size)
-//                 .get_mapped_range()
-//                 .unwrap();
+                        // 2. Распаковываем Some и добавляем все найденные элементы в вектор за один раз
+                        result.extend([batch_tuple.0, batch_tuple.1].into_iter().flatten());
+                        prev_count = count
+                    }
 
-//             if score_tx
-//                 .send(ScoreBatch {
-//                     scores_and_coords: bytemuck::cast_slice(&data_score).to_vec(),
-//                     cigar_bin: bytemuck::cast_slice(&data_cigar).to_vec(),
-//                 })
-//                 .await
-//                 .is_err()
-//             {
-//                 break;
-//             }
-//         }
+                    let group_start_gpu = count as u32;
+                    let group_count = (j - count) as u32;
+                    let info = (group_start_gpu << 2) | (group_count & 3);
 
-//         staging_scores.unmap();
-//         staging_cigar.unmap();
-//     }
-// }
+                    for k in count..j {
+                        push_task!(&chunk.single[k], info); // Чистый вызов макроса через !
+                    }
+
+                    count = j;
+                }
+
+                let batch_tuple = send_task(
+                    &gpu,
+                    &mut slot_idx,
+                    &(prev_count..count),
+                    &soa_packed_a,
+                    &soa_packed_b,
+                    &soa_mask_n_a,
+                    &soa_mask_n_b,
+                    &soa_group_info,
+                    &mut in_flight,
+                )
+                .await; // Здесь мы вышли из async-контекста и получили (Option, Option)
+
+                // 2. Распаковываем Some и добавляем все найденные элементы в вектор за один раз
+                result.extend([batch_tuple.0, batch_tuple.1].into_iter().flatten());
+
+                if score_tx
+                    .send(WriteButch::Single(SingleWriteButch {
+                        data: chunk,
+                        gpu_result: result,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return; // Канал закрыт, выходим из внешнего цикла
+                }
+            }
+
+            GpuBatch::Paired(chunk) => {
+                for pair in &chunk.pairs {
+                    if count + 2 > args.batch_size {
+                        let batch_tuple = send_task(
+                            &gpu,
+                            &mut slot_idx,
+                            &(prev_count..count),
+                            &soa_packed_a,
+                            &soa_packed_b,
+                            &soa_mask_n_a,
+                            &soa_mask_n_b,
+                            &soa_group_info,
+                            &mut in_flight,
+                        )
+                        .await; // Здесь мы вышли из async-контекста и получили (Option, Option)
+
+                        // 2. Распаковываем Some и добавляем все найденные элементы в вектор за один раз
+                        result.extend([batch_tuple.0, batch_tuple.1].into_iter().flatten());
+
+                        prev_count = count
+                    }
+
+                    let info1 = ((count as u32) << 2) | 1u32;
+                    push_task!(&pair.meta1, info1); // Неявная работа с count без ошибок заимствования!
+
+                    let info2 = ((count as u32) << 2) | 1u32;
+                    push_task!(&pair.meta2, info2);
+                }
+                let batch_tuple = send_task(
+                    &gpu,
+                    &mut slot_idx,
+                    &(prev_count..count),
+                    &soa_packed_a,
+                    &soa_packed_b,
+                    &soa_mask_n_a,
+                    &soa_mask_n_b,
+                    &soa_group_info,
+                    &mut in_flight,
+                )
+                .await; // Здесь мы вышли из async-контекста и получили (Option, Option)
+
+                // 2. Распаковываем Some и добавляем все найденные элементы в вектор за один раз
+                result.extend([batch_tuple.0, batch_tuple.1].into_iter().flatten());
+
+                if score_tx
+                    .send(WriteButch::Paired(PairedWriteButch {
+                        data: chunk,
+                        gpu_result: result,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return; // Канал закрыт, выходим из внешнего цикла
+                }
+            }
+        }
+
+        if count == 0 {
+            break;
+        }
+
+        soa_packed_a.clear();
+        soa_packed_b.clear();
+        soa_mask_n_a.clear();
+        soa_mask_n_b.clear();
+        soa_group_info.clear();
+    }
+}

@@ -28,6 +28,7 @@ use std::fmt::Write;
 use tokio::{io::AsyncWriteExt, sync::mpsc};
 
 pub struct ScoreBatch {
+    pub count: std::ops::Range<usize>,
     pub scores_and_coords: Vec<i32>, // Только 2 числа на рид: [score, align_start_j]
     pub cigar_bin: Vec<u32>,         // 16 бинарных чисел CIGAR
 }

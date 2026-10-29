@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 wgpu = "30.0"
-tokio = { version = "1.53.3", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 bytemuck = { version = "1", features = ["derive"] }
 bio = "4.2"
 clap = { version = "4", features = ["derive"] }
@@ -27,6 +27,7 @@ noodles = { version = "0.118", features = ["sam", "bam"] }
 # Для тонкого управления пулом сжатия под капотом noodles использует:
 noodles-bam = { version = "0.97", features = ["async"] }
 noodles-bgzf = { version = "0.52", features = ["libdeflate"] }
+soa_derive = "0.14"
 
 [profile.release]
 debug = true

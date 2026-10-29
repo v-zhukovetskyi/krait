@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://gnu.org/licenses/>.
 
+pub mod aggregator;
 pub mod gpu_actor;
 pub mod producer;
 pub mod reader;

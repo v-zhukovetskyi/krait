@@ -16,7 +16,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://gnu.org/licenses/>.
 
-
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
@@ -40,7 +39,7 @@ pub struct Args {
     pub batch_size: usize,
 
     #[arg(short = 'l', long, default_value_t = 0)]
-    pub limit: usize,
+    pub limit: u64,
 
     #[arg(short = 'p', long)]
     pub progress: bool,
