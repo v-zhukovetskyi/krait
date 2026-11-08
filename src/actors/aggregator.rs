@@ -1,270 +1,245 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Krait: GPU-Accelerated DNA Sequence Aligner for short reads.
+// Copyright (C) 2026 Valentyn Zhukovetskyi <zukovetski@gmail.com>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://gnu.org/licenses/>.
+
+use crossbeam::channel::Receiver;
+use std::ops::Range;
+
 use crate::{
     actors::producer::ComputeChunk,
-    constants::{N_MASK_WORDS, READ_WORDS, REF_WORDS},
+    constants::{READ_N_MASK_WORDS, READ_WORDS, REF_N_MASK_WORDS, REF_WORDS, STRIDE},
 };
-use std::collections::VecDeque;
-use tokio::sync::mpsc;
 
-// Сообщение-запрос от GPU-актора: "Дай мне batch_size задач"
-pub struct GpuRequest {
-    pub requested_size: usize,
-    pub respond_to: tokio::sync::oneshot::Sender<Option<GpuReadyBatch>>,
-}
-
-pub struct GpuReadyBatch {
-    pub soa_packed_a: Vec<u32>,
-    pub soa_packed_b: Vec<u32>,
-    pub soa_mask_n_a: Vec<u32>,
-    pub soa_mask_n_b: Vec<u32>,
-    pub soa_group_info: Vec<u32>,
-    pub count: usize, // Реальное количество задач (<= запрошенного)
-}
 pub struct GpuReadyBatch {
     pub soa_arena: Vec<u32>,
-    pub soa_packed_a: std::ops::Range<u64>,
-    pub soa_packed_b: std::ops::Range<u64>,
-    pub soa_mask_n_a: std::ops::Range<u64>,
-    pub soa_mask_n_b: std::ops::Range<u64>,
-    pub soa_group_info: std::ops::Range<u64>,
-    pub count: usize, // Реальное количество задач (<= запрошенного)
+    pub soa_packed_a: Range<usize>,
+    pub soa_packed_b: Range<usize>,
+    pub soa_mask_n_a: Range<usize>,
+    pub soa_mask_n_b: Range<usize>,
+    pub soa_group_info: Range<usize>,
+    pub count: usize,
 }
 
-pub async fn aggregator_task_1(
-    mut producer_rx: mpsc::Receiver<ComputeChunk>,
-    mut gpu_req_rx: mpsc::Receiver<GpuRequest>,
-    writer_data_tx: mpsc::Sender<WriterDataChunk>,
-    max_memory_tasks: usize, // Лимит на размер склада в ОЗУ (Backpressure)
-) {
-    // Внутренний склад задач
-    let mut task_queue: VecDeque<GpuTask> = VecDeque::with_capacity(max_memory_tasks);
+/// Coordinates batch assembly from producer chunks to GPU-bound Structure-of-Arrays (`SoA`) layout.
+pub fn run_aggregator_worker(
+    producer_rx: crossbeam::channel::Receiver<ComputeChunk>,
+    gpu_req_rx: crossbeam::channel::Receiver<usize>,
+    gpu_batch_tx: crossbeam::channel::Sender<Option<GpuReadyBatch>>,
+    max_alloc_size: usize,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("krait-aggregator".to_string())
+        .spawn(move || {
+            let mut state = AggregatorState::default();
 
-    // Очередь чанков с сырыми данными (ждут полной выработки)
-    let mut chunks_tracker: VecDeque<(Vec<u8>, std::ops::Range<u64>, usize)> = VecDeque::new();
-    // (сырые данные, диапазон id, сколько задач из этого чанка еще осталось на складе)
+            while let Ok(requested_size) = gpu_req_rx.recv() {
+                let batch_size = requested_size.min(max_alloc_size);
+                let batch = state.assemble_batch(&producer_rx, batch_size);
+                let is_empty = batch.is_none();
 
-    let mut producer_finished = false;
-
-    // Предвыделенные SoA-массивы максимального размера для быстрой сборки
-    let max_alloc_size = 131_072; // Максимально возможный батч GPU
-    let mut soa_packed_a = vec![0u32; max_alloc_size * REF_WORDS];
-    let mut soa_packed_b = vec![0u32; max_alloc_size * READ_WORDS];
-    let mut soa_mask_n_a = vec![0u32; max_alloc_size * N_MASK_WORDS];
-    let mut soa_mask_n_b = vec![0u32; max_alloc_size * N_MASK_WORDS];
-    let mut soa_group_info = vec![0u32; max_alloc_size];
-
-    loop {
-        tokio::select! {
-            // 1. ПРИЕМ НОВЫХ ДАННЫХ ОТ ПРОДЮСЕРА (только если на складе есть место)
-            maybe_chunk = producer_rx.recv(), if !producer_finished && task_queue.len() < max_memory_tasks => {
-                match maybe_chunk {
-                    Some(chunk) => {
-                        let task_count = chunk.tasks.len();
-                        if task_count > 0 {
-                            // Запоминаем чанк в трекер
-                            chunks_tracker.push_back((chunk.raw_data, chunk.read_id_range, task_count));
-                            // Ссыпаем задачи на общий склад
-                            task_queue.extend(chunk.tasks);
-                        }
-                    }
-                    None => {
-                        // Продюсер закончил чтение файла
-                        producer_finished = true;
-                    }
-                }
-            }
-
-            // 2. ОБСЛУЖИВАНИЕ ЗАПРОСА ОТ GPU-АКТОРА
-            Some(req) = gpu_req_rx.recv() => {
-                let batch_size = req.requested_size.min(max_alloc_size);
-
-                // Если задач на складе нет, и продюсер закончил — отправляем сигнал завершения
-                if task_queue.is_empty() && producer_finished {
-                    let _ = req.respond_to.send(None);
+                if gpu_batch_tx.send(batch).is_err() {
                     break;
                 }
 
-                // Забираем ровно столько, сколько есть, но не больше batch_size
-                let take_count = task_queue.len().min(batch_size);
-
-                if take_count > 0 {
-                    // РАСКЛАДЫВАЕМ В SoA НАПРЯМУЮ В L1/L2 КЭШЕ
-                    for count in 0..take_count {
-                        let task = task_queue.pop_front().unwrap();
-
-                        for w in 0..REF_WORDS {
-                            soa_packed_a[w * take_count + count] = task.packed_ref[w];
-                        }
-                        for w in 0..READ_WORDS {
-                            soa_packed_b[w * take_count + count] = task.packed_read[w];
-                        }
-                        for w in 0..N_MASK_WORDS {
-                            soa_mask_n_a[w * take_count + count] = task.mask_n_ref[w];
-                        }
-                        for w in 0..N_MASK_WORDS {
-                            soa_mask_n_b[w * take_count + count] = task.mask_n_read[w];
-                        }
-                        soa_group_info[count] = task.group_info;
-
-                        // Уменьшаем счетчик оставшихся задач у самого старого чанка
-                        if let Some(front_chunk) = chunks_tracker.front_mut() {
-                            front_chunk.2 -= 1;
-                            // Если чанк полностью выработан — отправляем его Райтеру!
-                            if front_chunk.2 == 0 {
-                                let (raw_data, id_range, _) = chunks_tracker.pop_front().unwrap();
-                                let _ = writer_data_tx.send(WriterDataChunk {
-                                    raw_data,
-                                    read_id_range: id_range,
-                                }).await;
-                            }
-                        }
-                    }
-
-                    // Формируем готовый GPU батч ровно на take_count задач
-                    let batch = GpuReadyBatch {
-                        soa_packed_a: soa_packed_a[..take_count * REF_WORDS].to_vec(),
-                        soa_packed_b: soa_packed_b[..take_count * READ_WORDS].to_vec(),
-                        soa_mask_n_a: soa_mask_n_a[..take_count * N_MASK_WORDS].to_vec(),
-                        soa_mask_n_b: soa_mask_n_b[..take_count * N_MASK_WORDS].to_vec(),
-                        soa_group_info: soa_group_info[..take_count].to_vec(),
-                        count: take_count,
-                    };
-
-                    let _ = req.respond_to.send(Some(batch));
-                } else {
-                    // Если склад временно пуст, но продюсер еще работает, шлем пустой батч на ожидание
-                    let _ = req.respond_to.send(Some(GpuReadyBatch {
-                        soa_packed_a: Vec::new(),
-                        soa_packed_b: Vec::new(),
-                        soa_mask_n_a: Vec::new(),
-                        soa_mask_n_b: Vec::new(),
-                        soa_group_info: Vec::new(),
-                        count: 0,
-                    }));
+                if is_empty && state.producer_finished {
+                    break;
                 }
             }
-        }
-    }
+        })
+        .unwrap()
 }
 
-pub async fn aggregator_task(
-    mut producer_rx: mpsc::Receiver<ComputeChunk>,
-    mut gpu_req_rx: mpsc::Receiver<GpuRequest>,
-    max_alloc_size: usize,
-) {
-    // Храним только трекер для райтера и остатки задач из текущего чанка
-    let mut current_chunk: Option<ComputeChunk> = None;
-    let mut current_task_idx = 0;
-    let mut producer_finished = false;
+/// Internal state of the aggregator actor.
+#[derive(Default)]
+struct AggregatorState {
+    current_cursor: Option<ChunkCursor>,
+    producer_finished: bool,
+}
 
-    // Цикл полностью просыпается ТОЛЬКО по запросу от GPU
-    while let Some(req) = gpu_req_rx.recv().await {
-        let batch_size = req.requested_size.min(max_alloc_size);
-
-        // Выделяем SoA-батч сразу нужного размера
-        let mut soa_packed_a = Vec::with_capacity(batch_size * REF_WORDS);
-        // ... (остальные соа массивы)
+impl AggregatorState {
+    /// Assembles an ``SoA`` GPU batch up to `batch_size`, fetching new chunks as necessary.
+    fn assemble_batch(
+        &mut self,
+        producer_rx: &Receiver<ComputeChunk>,
+        batch_size: usize,
+    ) -> Option<GpuReadyBatch> {
+        let layout = SoaLayout::new(batch_size);
+        let mut gpu_arena = vec![0u32; layout.total_words];
         let mut take_count = 0;
 
         while take_count < batch_size {
-            // Если текущий чанк закончился или еще не был взят, берем следующий из канала-буфера
-            if current_chunk.is_none() && !producer_finished {
-                // МГНОВЕННО забираем из канала, так как Продюсер заполнил его заранее!
-                // Если канал пуст, мы асинхронно подождем (но GPU тут не проиграет, так как данных физически еще нет)
-                match producer_rx.recv().await {
+            // Refill chunk from channel if depleted
+            if self.current_cursor.is_none() && !self.producer_finished {
+                match producer_rx.recv().ok() {
                     Some(chunk) => {
-                        current_chunk = Some(chunk);
-                        current_task_idx = 0;
+                        self.current_cursor = Some(ChunkCursor::new(chunk));
                     }
                     None => {
-                        producer_finished = true;
+                        self.producer_finished = true;
                     }
                 }
             }
 
-            // Если продюсер пуст и чанков больше нет — выходим из сборки батча
-            if current_chunk.is_none() && producer_finished {
+            if self.producer_finished && self.current_cursor.is_none() {
                 break;
             }
 
-            // Извлекаем задачи из текущего активного чанка
-            if let Some(chunk) = &current_chunk {
-                let task = &chunk.tasks[current_task_idx];
+            // Scoped extraction avoiding any borrow collisions with `self`
+            let is_drained = if let Some(cursor) = &mut self.current_cursor {
+                cursor.transcribe(&mut gpu_arena, &layout, &mut take_count, batch_size)
+            } else {
+                break;
+            };
 
-                // Прямая SoA-упаковка (мгновенно в кэш процессора)
-                // soa_packed_a.push(...) и т.д.
-
-                current_task_idx += 1;
-                take_count += 1;
-
-                // Если чанк полностью исчерпан
+            if is_drained {
+                self.current_cursor = None;
+            } else {
+                // Preserved candidate family boundary; finalize current batch
+                break;
             }
         }
 
-        // Финишный сценарий: батч пуст и продюсер завершился
-        if take_count == 0 && producer_finished {
-            let _ = req.respond_to.send(None);
-            break;
+        if take_count == 0 && self.producer_finished {
+            return None;
         }
 
-        // Отправляем сформированный батч на GPU
-        let batch = GpuReadyBatch {
-            /* ... */ count: take_count,
-        };
-        let _ = req.respond_to.send(Some(batch));
+        Some(GpuReadyBatch {
+            soa_arena: gpu_arena,
+            soa_packed_a: layout.seq_a,
+            soa_packed_b: layout.seq_b,
+            soa_mask_n_a: layout.ref_mask,
+            soa_mask_n_b: layout.read_mask,
+            soa_group_info: layout.group_info,
+            count: take_count,
+        })
     }
 }
 
-
-
-const STRIDE: usize = REF_WORDS + READ_WORDS + (N_MASK_WORDS * 2) + 1;
-
-let total_u32_size = take_count * STRIDE;
-
-// Выделяем память ОДИН РАЗ под все 5 массивов сразу
-let mut arena = vec![0u32; total_u32_size];
-
-// Размечаем диапазоны (Range) в этой арене друг за другом
-let a_start = 0;
-let a_end = a_start + (take_count * REF_WORDS);
-
-let b_start = a_end;
-let b_end = b_start + (take_count * READ_WORDS);
-
-let mask_a_start = b_end;
-let mask_a_end = mask_a_start + (take_count * N_MASK_WORDS);
-
-let mask_b_start = mask_a_end;
-let mask_b_end = mask_b_start + (take_count * N_MASK_WORDS);
-
-let info_start = mask_b_end;
-let info_end = info_start + take_count;
-
-for task_idx in 0..batch_size {
-    let base = task_idx * STRIDE;
-    
-    // 0..8: packed_ref
-    for w in 0..REF_WORDS { gpu_arena[a_start + w * batch_size + task_idx] = task_arena[base + w]; }
-    
-    // 8..15: packed_read
-    for w in 0..READ_WORDS { gpu_arena[b_start + w * batch_size + task_idx] = task_arena[base + REF_WORDS + w]; }
-    
-    // 15..19: mask_n_ref
-    for w in 0..N_MASK_WORDS { gpu_arena[mask_a_start + w * batch_size + task_idx] = task_arena[base + REF_WORDS + READ_WORDS + w]; }
-    
-    // 19..23: mask_n_read
-    for w in 0..N_MASK_WORDS { gpu_arena[mask_b_start + w * batch_size + task_idx] = task_arena[base + REF_WORDS + READ_WORDS + N_MASK_WORDS + w]; }
-    
-    // 23: group_info
-    gpu_arena[info_start + task_idx] = task_arena[base + REF_WORDS + READ_WORDS + N_MASK_WORDS * 2];
+/// Computes range partitions and overall buffer dimensions for `SoA` columns.
+struct SoaLayout {
+    seq_a: Range<usize>,
+    seq_b: Range<usize>,
+    ref_mask: Range<usize>,
+    read_mask: Range<usize>,
+    group_info: Range<usize>,
+    total_words: usize,
 }
 
-// Сборка батча (передаем саму арену и диапазоны)
-let batch = GpuReadyBatch {
-    soa_arena: arena, // Вектор перемещается (move), аллокации не происходит!
-    soa_packed_a: a_start..a_end,
-    soa_packed_b: b_start..b_end,
-    soa_mask_n_a: mask_a_start..mask_a_end,
-    soa_mask_n_b: mask_b_start..mask_b_end,
-    soa_group_info: info_start..info_end,
-    count: take_count,
-};
+impl SoaLayout {
+    const fn new(batch_size: usize) -> Self {
+        let a_len = batch_size * REF_WORDS;
+        let b_len = batch_size * READ_WORDS;
+        let a_mask_len = batch_size * REF_N_MASK_WORDS;
+        let b_mask_len = batch_size * READ_N_MASK_WORDS;
+        let info_len = batch_size;
+
+        let seq_a = 0..a_len;
+        let seq_b = seq_a.end..seq_a.end + b_len;
+        let ref_mask = seq_b.end..seq_b.end + a_mask_len;
+        let read_mask = ref_mask.end..ref_mask.end + b_mask_len;
+        let group_info = read_mask.end..read_mask.end + info_len;
+
+        // Read total_words before group_info is moved into Self
+        let total_words = group_info.end;
+
+        Self {
+            seq_a,
+            seq_b,
+            ref_mask,
+            read_mask,
+            group_info,
+            total_words,
+        }
+    }
+}
+
+/// Maintains reading cursor and state over an active producer compute chunk.
+struct ChunkCursor {
+    chunk: ComputeChunk,
+    task_idx: usize,
+}
+
+impl ChunkCursor {
+    const fn new(chunk: ComputeChunk) -> Self {
+        Self { chunk, task_idx: 0 }
+    }
+
+    /// Transcribes tasks from ``AoS`` layout into column-major ``SoA`` arrays.
+    ///
+    /// Returns `true` if the chunk was completely exhausted, or `false` if copying
+    /// stopped early to prevent splitting a candidate family across batch boundaries.
+    fn transcribe(
+        &mut self,
+        gpu_arena: &mut [u32],
+        layout: &SoaLayout,
+        take_count: &mut usize,
+        batch_size: usize,
+    ) -> bool {
+        let task_arena = &self.chunk.task_arena;
+
+        while self.task_idx < self.chunk.task_count && *take_count < batch_size {
+            let src_base = self.task_idx * STRIDE;
+
+            // Parse temporary candidate family info from the 24th task word
+            let temp_info = task_arena[src_base + 23];
+            let cand_offset = (temp_info & 3) as usize;
+            let group_count = (temp_info >> 2) as usize;
+
+            // Protect family integrity: defer entire group if it cannot fit in remaining batch capacity
+            if cand_offset == 0 && (*take_count + group_count > batch_size) {
+                return false;
+            }
+
+            let dst_idx = *take_count;
+
+            // 1. Packed reference (words 0..8)
+            for w in 0..REF_WORDS {
+                gpu_arena[layout.seq_a.start + w * batch_size + dst_idx] = task_arena[src_base + w];
+            }
+
+            // 2. Packed read (words 8..15)
+            for w in 0..READ_WORDS {
+                gpu_arena[layout.seq_b.start + w * batch_size + dst_idx] =
+                    task_arena[src_base + REF_WORDS + w];
+            }
+
+            // 3. Mask N reference (words 15..19)
+            for w in 0..REF_N_MASK_WORDS {
+                gpu_arena[layout.ref_mask.start + w * batch_size + dst_idx] =
+                    task_arena[src_base + REF_WORDS + READ_WORDS + w];
+            }
+
+            // 4. Mask N read (words 19..23)
+            for w in 0..READ_N_MASK_WORDS {
+                gpu_arena[layout.read_mask.start + w * batch_size + dst_idx] =
+                    task_arena[src_base + REF_WORDS + READ_WORDS + REF_N_MASK_WORDS + w];
+            }
+
+            // 5. Final group info calculation for GPU traceback (word 23)
+            let group_start_gpu =
+                (u32::try_from(dst_idx).unwrap()) - (u32::try_from(cand_offset).unwrap());
+
+            let final_gpu_info = (group_start_gpu << 2) | (u32::try_from(group_count).unwrap() & 3);
+            gpu_arena[layout.group_info.start + dst_idx] = final_gpu_info;
+
+            self.task_idx += 1;
+            *take_count += 1;
+        }
+
+        self.task_idx >= self.chunk.task_count
+    }
+}

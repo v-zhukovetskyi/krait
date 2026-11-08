@@ -12,22 +12,26 @@ name = "krait"
 path = "src/main.rs"
 
 [dependencies]
-wgpu = "30.0"
-tokio = { version = "1.54", features = ["full"] }
-bytemuck = { version = "1", features = ["derive"] }
-bio = "4.2"
-clap = { version = "4", features = ["derive"] }
-flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
-rayon = "1"
-indicatif = "0.18"
-fxhash = "0.2"
-fearless_simd = "1.1.0"
-rustc-hash = "2.1"
-noodles = { version = "0.118", features = ["sam", "bam"] }
-# Для тонкого управления пулом сжатия под капотом noodles использует:
-noodles-bam = { version = "0.97", features = ["async"] }
-noodles-bgzf = { version = "0.52", features = ["libdeflate"] }
-soa_derive = "0.14"
+wgpu = "^30.0"
+bytemuck = { version = "^1", features = ["derive"] }
+clap = { version = "^4.6.7", features = ["derive"] }
+flate2 = { version = "^1", features = ["zlib-rs"], default-features = false }
+rayon = "^1"
+indicatif = "^0.18"
+fxhash = "^0.2"
+fearless_simd = "^1.2.0"
+
+noodles-bam = "^0.98"
+noodles-bgzf = "^0.52"
+soa_derive = "^0.14"
+crossbeam = "^0.8"
+pollster = "^1.0"
+memchr = "2.8.3"
 
 [profile.release]
 debug = true
+
+[profile.profiling]
+inherits = "release"
+debug = true
+inline-threshold = 0

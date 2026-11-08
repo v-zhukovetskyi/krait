@@ -16,23 +16,20 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://gnu.org/licenses/>.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
-
-use bio::io::fasta;
 use fxhash::{FxBuildHasher, FxHashMap};
 use rayon::prelude::*;
-use tokio::sync::mpsc;
 
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
+
+use crate::actors::reader::{FastqChunk, SingleOffsets};
 use crate::{
-    actors::reader::{ChunkBuffer, PairChunkBuffer, SingleChunkBuffer, open_flexible_reader},
     cli::Args,
-    constants::{PADDING_LEN, READ_LEN, REF_LEN},
+    constants::{
+        FLANK, MAX_CANDIDATE_PAIRS, MAX_INSERT, MIN_INSERT, READ_LEN, REF_LEN,
+        RESCUE_OFFSET, RESCUE_TLEN,
+    },
 };
-
-// Эта функция берет ОДИН рид и пытается найти ему место в геноме
-#[derive(Clone)]
 pub struct SingleMeta {
-    pub id: u64,
     pub name: std::ops::Range<usize>,
     pub pos: u32,
     pub seq: std::ops::Range<usize>,
@@ -40,9 +37,7 @@ pub struct SingleMeta {
     pub is_rev: bool,
 }
 
-#[derive(Clone)]
 pub struct PairedMeta {
-    pub id: u64,
     pub name: std::ops::Range<usize>,
     pub pos: u32,
     pub seq: std::ops::Range<usize>,
@@ -51,26 +46,32 @@ pub struct PairedMeta {
     pub is_proper: bool,
     pub tlen: i32,
 }
+
 pub struct SingleWriteBatch {
-    raw_data: Vec<u8>,
-    meta: Vec<SingleMeta>,
-    id_range: std::ops::Range<u64>,
+    pub raw_data: Vec<u8>,
+    pub meta: Vec<SingleMeta>,
 }
 
 pub struct PairedWriteBatch {
-    raw_data: Vec<u8>,
-    meta: Vec<PairedMeta>,
-    id_range: std::ops::Range<u64>,
+    pub raw_data1: Vec<u8>,
+    pub raw_data2: Vec<u8>,
+    pub meta: Vec<PairedMeta>,
 }
+
 pub enum WriteBatch {
     Single(SingleWriteBatch),
     Paired(PairedWriteBatch),
 }
 
 pub struct ComputeChunk {
-    pub task_arena: Vec<u32>, // Сплошной массив, где каждые 24 числа = 1 задача
-    pub task_count: usize,    // Сколько всего задач (arena.len() / 24)
-    pub id_range: std::ops::Range<u64>, // Сплошной массив, где каждые 24 числа = 1 задача   // Сколько всего задач (arena.len() / 24)
+    pub task_arena: Vec<u32>,
+    pub task_count: usize,
+}
+
+pub struct Contig {
+    pub name: String,
+    pub len: usize,
+    pub global_start: usize,
 }
 
 pub struct ReferenceGenome {
@@ -79,9 +80,9 @@ pub struct ReferenceGenome {
 }
 
 impl ReferenceGenome {
-    // Быстрый перевод глобальной координаты в (Имя_хромосомы, 1-based_позиция)
+    /// Maps a global 0-based coordinate to its contig name and 1-based local position.
     pub fn resolve_coords(&self, global_pos: usize) -> Option<(&str, usize)> {
-        // Бинарный поиск: находим контиг, у которого global_start <= global_pos
+        // Binary search for the contig satisfying global_start <= global_pos
         let idx = self
             .contigs
             .partition_point(|c| c.global_start <= global_pos)
@@ -91,14 +92,266 @@ impl ReferenceGenome {
         let local_pos = global_pos - contig.global_start;
 
         if local_pos < contig.len {
-            Some((&contig.name, local_pos + 1)) // SAM использует 1-based индекс!
+            Some((&contig.name, local_pos + 1)) // SAM specification uses 1-based indexing
         } else {
-            None // Попали в защитную зону из 'N' между хромосомами
+            None // Falls into the inter-contig 'N' padding gap
         }
     }
 }
 
-fn reverse_complement(seq: &[u8]) -> Vec<u8> {
+pub enum ReaderInput {
+    Single(crossbeam::channel::Receiver<FastqChunk>),
+    Paired(
+        crossbeam::channel::Receiver<FastqChunk>,
+        crossbeam::channel::Receiver<FastqChunk>,
+    ),
+}
+
+/// Spawns the producer thread responsible for k-mer indexing and chunk processing.
+pub fn run_producer_worker(
+    args: Args,
+    genome: Arc<ReferenceGenome>,
+    input: ReaderInput,
+    producer_tx: crossbeam::channel::Sender<ComputeChunk>,
+    meta_tx: crossbeam::channel::Sender<WriteBatch>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("krait-producer".to_string())
+        .spawn(move || {
+            let index = build_kmer_index(&genome, args.kmer_size);
+            let mut base_read_id = 0u64;
+
+            match input {
+                ReaderInput::Single(rx) => {
+                    while let Ok(chunk) = rx.recv() {
+                        let (wb, cb) =
+                            process_single_chunk(chunk, &genome, &index, &args, &mut base_read_id);
+                        if producer_tx.send(cb).is_err() || meta_tx.send(wb).is_err() {
+                            break;
+                        }
+                        if args.limit > 0 && base_read_id >= args.limit {
+                            return;
+                        }
+                    }
+                }
+                ReaderInput::Paired(r1_rx, r2_rx) => {
+                    while let (Ok(chunk1), Ok(chunk2)) = (r1_rx.recv(), r2_rx.recv()) {
+                        let (wb, cb) = process_paired_chunks(
+                            chunk1,
+                            chunk2,
+                            &genome,
+                            &index,
+                            &args,
+                            &mut base_read_id,
+                        );
+                        if producer_tx.send(cb).is_err() || meta_tx.send(wb).is_err() {
+                            break;
+                        }
+                        if args.limit > 0 && base_read_id >= args.limit {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .unwrap()
+}
+
+fn build_kmer_index(
+    genome: &Arc<ReferenceGenome>,
+    kmer_size: usize,
+) -> HashMap<u32, u32, std::hash::BuildHasherDefault<fxhash::FxHasher>> {
+    println!("[Producer] Building k-mer index (k={kmer_size})...");
+    let mut index: FxHashMap<u32, u32> = FxHashMap::default();
+
+    if genome.seq.len() >= kmer_size {
+        for i in 0..=(genome.seq.len() - kmer_size) {
+            if let Some(kmer) = pack_kmer(&genome.seq[i..i + kmer_size], kmer_size) {
+                index
+                    .entry(kmer)
+                    .and_modify(|pos| *pos = u32::MAX) // Invalidate non-unique k-mers
+                    .or_insert_with(|| u32::try_from(i).unwrap());
+            }
+        }
+    }
+
+    index.retain(|_, &mut pos| pos != u32::MAX);
+    println!("[Producer] Index built. Unique anchors: {}", index.len());
+    index
+}
+
+/// Processes a Single-End FASTQ chunk, extracting candidate alignment tasks.
+fn process_single_chunk(
+    chunk: FastqChunk,
+    genome: &Arc<ReferenceGenome>,
+    index: &HashMap<u32, u32, FxBuildHasher>,
+    args: &Args,
+    base_read_id: &mut u64,
+) -> (WriteBatch, ComputeChunk) {
+    let genome_len = genome.seq.len();
+    let num_seq = chunk.data.len();
+
+    // 1. Parallel candidate discovery and task generation via Rayon
+    let results: Vec<(SingleMeta, [u32; 24])> = chunk
+        .offsets
+        .par_iter()
+        .flat_map_iter(|offset| {
+            let mut seq = Cow::Borrowed(&chunk.data[offset.seq.clone()]);
+            let mut seeds = find_seeds(&seq, genome_len, index, args.kmer_size);
+            let is_rev = seeds.is_empty();
+
+            if seeds.is_empty() {
+                seq = Cow::Owned(reverse_complement(&chunk.data[offset.seq.clone()]));
+                seeds = find_seeds(&seq, genome_len, index, args.kmer_size);
+            }
+
+            let (packed_read, mask_n_read) = pack_read_stack(&seq);
+            let n_cands = u32::try_from(seeds.len).unwrap();
+
+            (0..seeds.len).into_iter().map(move |x| {
+                let ref_snippet = &genome.seq[seeds.data[x]..seeds.data[x] + REF_LEN];
+                let (packed_ref, mask_n_ref) = pack_ref_stack(ref_snippet);
+                let group_info = (n_cands << 2) | (u32::try_from(x).unwrap() & 3);
+
+                let task_words = assemble_task_words(
+                    packed_ref,
+                    packed_read,
+                    mask_n_ref,
+                    mask_n_read,
+                    group_info,
+                );
+
+                let meta = SingleMeta {
+                    name: offset.name.clone(),
+                    pos: u32::try_from(seeds.data[x]).unwrap(),
+                    seq: offset.seq.clone(),
+                    qual: offset.qual.clone(),
+                    is_rev,
+                };
+
+                (meta, task_words)
+            })
+        })
+        .collect();
+
+    // 2. Flatten tasks into continuous arena and collect metadata
+    let mut task_arena = Vec::with_capacity(results.len() * 24);
+    let mut meta_list = Vec::with_capacity(results.len());
+
+    for (meta, task_words) in results {
+        task_arena.extend_from_slice(&task_words);
+        meta_list.push(meta);
+    }
+
+    let compute_chunk = ComputeChunk {
+        task_arena,
+        task_count: meta_list.len(),
+    };
+
+    let write_batch = WriteBatch::Single(SingleWriteBatch {
+        raw_data: chunk.data,
+        meta: meta_list,
+    });
+
+    *base_read_id += num_seq as u64;
+
+    (write_batch, compute_chunk)
+}
+
+/// Stack-allocated container for tripartite seed hits (at most 3 elements).
+/// Zero heap allocations!
+#[derive(Default, Clone, Copy)]
+pub struct SeedHits {
+    pub data: [usize; 3],
+    pub len: usize,
+}
+
+impl SeedHits {
+    pub const fn push(&mut self, val: usize) {
+        if self.len < 3 {
+            self.data[self.len] = val;
+            self.len += 1;
+        }
+    }
+
+    pub fn as_slice(&self) -> &[usize] {
+        &self.data[..self.len]
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn sort_unstable(&mut self) {
+        self.data[..self.len].sort_unstable();
+    }
+}
+
+/// Finds candidate genomic alignment coordinates using tripartite anchor seeds.
+pub fn find_seeds(
+    seq: &[u8],
+    genome_len: usize,
+    index: &FxHashMap<u32, u32>,
+    kmer_size: usize,
+) -> SeedHits {
+    let read_len = seq.len();
+    if read_len < kmer_size {
+        return SeedHits::default();
+    }
+
+    let seed_offsets = [0, (read_len - kmer_size) / 2, read_len - kmer_size];
+    let mut hits = SeedHits::default();
+
+    for &offset in &seed_offsets {
+        let Some(kmer) = pack_kmer(&seq[offset..offset + kmer_size], kmer_size) else {
+            continue;
+        };
+
+        let Some(&hit_pos) = index.get(&kmer) else {
+            continue;
+        };
+
+        let ref_start = (hit_pos as usize)
+            .saturating_sub(offset)
+            .saturating_sub(FLANK);
+
+        let ref_window_len = read_len + 2 * FLANK;
+        if ref_start + ref_window_len <= genome_len {
+            // Check duplicates in stack slice:
+            let is_duplicate = hits
+                .as_slice()
+                .iter()
+                .any(|&pos| pos.abs_diff(ref_start) < 50);
+            if !is_duplicate {
+                hits.push(ref_start);
+            }
+        }
+    }
+
+    hits
+}
+
+/// 2-bit packs a k-mer into a u32 integer. Returns `None` if the k-mer contains 'N' or lowercase (soft-masked) bases.
+fn pack_kmer(seq: &[u8], k: usize) -> Option<u32> {
+    if seq.len() < k {
+        return None;
+    }
+    let mut kmer = 0u32;
+    for &b in &seq[0..k] {
+        let val = match b {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => return None, // Exclude soft-masked lowercase letters and ambiguous bases
+        };
+        kmer = (kmer << 2) | val;
+    }
+    Some(kmer)
+}
+
+/// Generates the reverse complement of a nucleotide sequence.
+pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter()
         .rev()
         .map(|&b| match b.to_ascii_uppercase() {
@@ -111,8 +364,7 @@ fn reverse_complement(seq: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-// Упаковка рида (100 bp)
-#[inline]
+/// 2-bit packs query read bases into seven u32 words and four u32 'N' mask words.
 fn pack_read_stack(seq: &[u8]) -> ([u32; 7], [u32; 4]) {
     let mut packed = [0u32; 7];
     let mut n_mask = [0u32; 4];
@@ -133,8 +385,7 @@ fn pack_read_stack(seq: &[u8]) -> ([u32; 7], [u32; 4]) {
     (packed, n_mask)
 }
 
-// Упаковка референса (128 bp)
-#[inline]
+/// 2-bit packs reference bases into eight u32 words and four u32 'N' mask words.
 fn pack_ref_stack(seq: &[u8]) -> ([u32; 8], [u32; 4]) {
     let mut packed = [0u32; 8];
     let mut n_mask = [0u32; 4];
@@ -155,229 +406,7 @@ fn pack_ref_stack(seq: &[u8]) -> ([u32; 8], [u32; 4]) {
     (packed, n_mask)
 }
 
-// Возвращает (2-bit packed, N-mask)
-fn pack_dna_with_mask(seq: &[u8], expected_words: usize) -> (Vec<u32>, Vec<u32>) {
-    let mut packed = vec![0u32; expected_words];
-    let n_mask_words = expected_words.div_ceil(2); // 16 баз на u32 в 2-битном vs 32 базы на u32 в маске
-    let mut n_mask = vec![0u32; n_mask_words.max(4)];
-
-    for (i, &b) in seq.iter().enumerate() {
-        let (val, is_n) = match b.to_ascii_uppercase() {
-            b'A' => (0, false),
-            b'C' => (1, false),
-            b'G' => (2, false),
-            b'T' => (3, false),
-            _ => (0, true), // 'N' или мусор: пишем 0, но ставим бит в маске N!
-        };
-
-        packed[i / 16] |= val << ((i % 16) * 2);
-        if is_n {
-            n_mask[i / 32] |= 1 << (i % 32);
-        }
-    }
-    (packed, n_mask)
-}
-
-fn pack_kmer(seq: &[u8], k: usize) -> Option<u32> {
-    if seq.len() < k {
-        return None;
-    }
-    let mut kmer = 0u32;
-    for &b in &seq[0..k] {
-        // Soft-masking: если буква строчная (повтор) или 'N', мы возвращаем None!
-        let val = match b {
-            b'A' => 0,
-            b'C' => 1,
-            b'G' => 2,
-            b'T' => 3,
-            _ => return None, // Строчные a,c,g,t тоже попадут сюда и отфильтруются!
-        };
-        kmer = (kmer << 2) | val;
-    }
-    Some(kmer)
-}
-
-pub fn load_reference(path: &str) -> ReferenceGenome {
-    let fasta_reader = fasta::Reader::new(open_flexible_reader(path));
-    let mut seq = Vec::new();
-    let mut contigs = Vec::new();
-
-    for record in fasta_reader.records() {
-        let rec = record.unwrap();
-        let name = rec.id().to_string();
-        let raw_seq = rec.seq();
-        let len = raw_seq.len();
-
-        let global_start = seq.len();
-        seq.extend_from_slice(raw_seq);
-
-        contigs.push(Contig {
-            name,
-            len,
-            global_start,
-        });
-
-        // Вставляем подушку из N, чтобы разнести хромосомы
-        seq.extend(std::iter::repeat_n(b'N', PADDING_LEN));
-    }
-
-    ReferenceGenome { seq, contigs }
-}
-
-const MIN_INSERT: usize = 100;
-const MAX_INSERT: usize = 800;
-
-// Возвращает (pos_left, pos_right, tlen, r1_is_left), если пара корректна
-fn check_proper_pair(
-    pos1: usize,
-    is_rev1: bool,
-    pos2: usize,
-    is_rev2: bool,
-) -> Option<(usize, usize, i32, bool)> {
-    // 1. Цепи обязаны быть противоположными
-    if is_rev1 == is_rev2 {
-        return None;
-    }
-
-    // В Illumina FR: рид на прямой цепи ВСЕГДА идет левее рида на обратной цепи!
-    let (left_pos, right_pos, r1_is_left) = if !is_rev1 && is_rev2 {
-        (pos1, pos2, true)
-    } else if is_rev1 && !is_rev2 {
-        (pos2, pos1, false)
-    } else {
-        return None;
-    };
-
-    if right_pos < left_pos {
-        return None;
-    }
-
-    let tlen = (right_pos + READ_LEN) - left_pos;
-
-    if (MIN_INSERT..=MAX_INSERT).contains(&tlen) {
-        Some((left_pos, right_pos, tlen as i32, r1_is_left))
-    } else {
-        None
-    }
-}
-
-#[derive(Clone)]
-pub struct Contig {
-    pub name: String,
-    pub len: usize,
-    pub global_start: usize,
-}
-
-pub fn producer_task(
-    args: Args,
-    genome: Arc<ReferenceGenome>,
-    mut chunk_rx: mpsc::Receiver<ChunkBuffer>,
-    gpu_tx: mpsc::Sender<ComputeChunk>,
-    meta_tx: mpsc::Sender<WriteBatch>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
-        println!(
-            "🧠 [Producer] Строим k-mer индекс (k={})...",
-            args.kmer_size
-        );
-        let mut index: FxHashMap<u32, u32> = FxHashMap::default();
-
-        if genome.seq.len() >= args.kmer_size {
-            for i in 0..=(genome.seq.len() - args.kmer_size) {
-                if let Some(kmer) = pack_kmer(&genome.seq[i..i + args.kmer_size], args.kmer_size) {
-                    index
-                        .entry(kmer)
-                        .and_modify(|pos| *pos = u32::MAX)
-                        .or_insert_with(|| u32::try_from(i).unwrap());
-                }
-            }
-        }
-
-        index.retain(|_, &mut pos| pos != u32::MAX);
-        println!(
-            "✅ [Producer] Индекс построен. Уникальных якорей: {}",
-            index.len()
-        );
-
-        let mut base_read_id = 0u64;
-
-        while let Some(chunk) = chunk_rx.blocking_recv() {
-            let (write_batch, compute_chunk) = match chunk {
-                ChunkBuffer::Single(chunk) => {
-                    process_single_chunk(chunk, &genome, &index, &args, &mut base_read_id)
-                }
-                ChunkBuffer::Paired(chunk) => {
-                    process_paired_chunk(chunk, &genome, &index, &args, &mut base_read_id)
-                }
-            };
-
-            if gpu_tx.blocking_send(compute_chunk).is_err() {
-                break;
-            }
-            if meta_tx.blocking_send(write_batch).is_err() {
-                break;
-            }
-
-            if args.limit > 0 && base_read_id >= args.limit {
-                return;
-            }
-        }
-    })
-}
-
-const FLANK: usize = 14; // Запас слева для центрирования в полосе W=32
-
-/// Ищет до 3 уникальных предполагаемых точек посадки (ref_start) для рида в геноме
-pub fn find_seeds(
-    seq: &[u8],
-    genome_len: usize,
-    index: &FxHashMap<u32, u32>,
-    kmer_size: usize,
-) -> Vec<usize> {
-    let read_len = seq.len();
-    if read_len < kmer_size {
-        return Vec::new();
-    }
-
-    // 1. Формула геометрии сидов: Начало, Центр, Конец
-    let seed_offsets = [0, (read_len - kmer_size) / 2, read_len - kmer_size];
-
-    let mut hits = Vec::with_capacity(3);
-
-    for &offset in &seed_offsets {
-        // Упаковываем k-мер (если встретится 'N' или мусор — pack_kmer вернет None)
-        let Some(kmer) = pack_kmer(&seq[offset..offset + kmer_size], kmer_size) else {
-            continue;
-        };
-
-        // Заглядываем в хэш-таблицу
-        let Some(&hit_pos) = index.get(&kmer) else {
-            continue;
-        };
-
-        // Проецируем координату сида на начало рида с отступом FLANK:
-        // ref_start = hit_pos - offset - FLANK
-        let ref_start = (hit_pos as usize)
-            .saturating_sub(offset)
-            .saturating_sub(FLANK);
-
-        // Проверяем, что окно не вылезет за конец генома
-        // (Окно референса = read_len + 2 * FLANK)
-        let ref_window_len = read_len + 2 * FLANK;
-        if ref_start + ref_window_len <= genome_len {
-            // Фильтр дубликатов: если этот сид попал в то же самое место (+/- 50 bp),
-            // что и предыдущий сид этого же рида — не дублируем
-            let is_duplicate = hits.iter().any(|&pos: &usize| pos.abs_diff(ref_start) < 50);
-            if !is_duplicate {
-                hits.push(ref_start);
-            }
-        }
-    }
-
-    hits
-}
-
-#[inline]
+/// Assembles the 24-word GPU task payload.
 fn assemble_task_words(
     packed_ref: [u32; 8],
     packed_read: [u32; 7],
@@ -394,95 +423,202 @@ fn assemble_task_words(
     words
 }
 
-fn process_single_chunk(
-    chunk: SingleChunkBuffer,
+const PRODUCER_CHUNK_SIZE: usize = 512;
+
+/// Processes a batch of paired-end reads, performing seed discovery and GPU task generation.
+pub fn process_paired_chunks(
+    chunk1: FastqChunk,
+    chunk2: FastqChunk,
     genome: &Arc<ReferenceGenome>,
     index: &HashMap<u32, u32, FxBuildHasher>,
     args: &Args,
     base_read_id: &mut u64,
 ) -> (WriteBatch, ComputeChunk) {
     let genome_len = genome.seq.len();
-    let num_seq = chunk.single.len();
-    let start_id = *base_read_id; // Защита от ругани компилятора
+    let num_pairs = chunk1.offsets.len().min(chunk2.offsets.len());
+    let c1 = &chunk1;
+    let c2 = &chunk2;
 
-    // 1. ПАРАЛЛЕЛЬНАЯ ОБРАБОТКА (ЧИСТЫЙ RAYON БЕЗ АЛЛОКАЦИЙ ВНУТРИ)
-    let results: Vec<(SingleMeta, [u32; 24])> = chunk
-        .single
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(local_idx, single)| {
-            let read_id = start_id + local_idx as u64;
-            let mut seq = Cow::Borrowed(&chunk.data[single.seq.clone()]);
-            let mut seeds = find_seeds(&seq, genome_len, index, args.kmer_size);
-            let mut is_rev = false;
-
-            if seeds.is_empty() {
-                seq = Cow::Owned(reverse_complement(&chunk.data[single.seq.clone()]));
-                seeds = find_seeds(&seq, genome_len, index, args.kmer_size);
-                is_rev = true;
-            };
-
-            let (packed_read, mask_n_read) = pack_read_stack(&seq);
-            let is_rev = is_rev;
-            let n_cands = seeds.len() as u32;
-
-            // Ленивый итератор выдает заготовки задач (слово 23 пока оставляем 0)
-            seeds.into_iter().enumerate().map(move |(x, seed)| {
-                let ref_snippet = &genome.seq[seed..seed + REF_LEN];
-                let (packed_ref, mask_n_ref) = pack_ref_stack(ref_snippet);
-                let group_info = (n_cands << 2) | (x as u32 & 3);
-
-                let task_words = assemble_task_words(
-                    packed_ref,
-                    packed_read,
-                    mask_n_ref,
-                    mask_n_read,
-                    group_info,
-                );
-
-                let meta = SingleMeta {
-                    id: read_id,
-                    name: single.name.clone(),
-                    pos: seed as u32,
-                    seq: single.seq.clone(),
-                    qual: single.qual.clone(),
-                    is_rev,
-                };
-
-                (meta, task_words)
-            })
-        })
+    // 1. Partition the pair indices into coarse-grained ranges (e.g. 512 pairs per chunk).
+    // This creates only ~32-64 tasks for Rayon, avoiding all work-stealing overhead.
+    let chunk_ranges: Vec<(usize, usize)> = (0..num_pairs)
+        .step_by(PRODUCER_CHUNK_SIZE)
+        .map(|start| (start, (start + PRODUCER_CHUNK_SIZE).min(num_pairs)))
         .collect();
 
-    // 2. БЫСТРАЯ СБОРКА АРЕНЫ И РАСЧЕТ ЧЕСТНЫХ GPU-ИНДЕКСОВ GROUP_INFO (~0.2 мс)
-    let mut task_arena = Vec::with_capacity(results.len() * 24);
-    let mut meta_list = Vec::with_capacity(results.len());
+    // 2. Parallel processing: each thread fills a single preallocated buffer for all 512 pairs.
+    // Zero heap allocations per individual read pair!
+    let chunk_results: Vec<(Vec<u32>, Vec<PairedMeta>)> = chunk_ranges
+        .into_par_iter()
+        .map(|(start_idx, end_idx)| {
+            let count = end_idx - start_idx;
+            // Preallocate assuming ~2 tasks per pair (typical Illumina concordance)
+            let mut local_arena = Vec::with_capacity(count * 2 * 24);
+            let mut local_meta = Vec::with_capacity(count * 2);
 
-    for (meta, task_words) in results {
-        task_arena.extend_from_slice(&task_words);
-        meta_list.push(meta);
+            for i in start_idx..end_idx {
+                let o1 = &chunk1.offsets[i];
+                let o2 = &chunk2.offsets[i];
+
+                let (candidates, ctx) = PairAlignmentContext::find(
+                    o1,
+                    o2,
+                    &c1.data,
+                    &c2.data,
+                    genome_len,
+                    index,
+                    args.kmer_size,
+                );
+
+                for (cand_idx, cand) in candidates.into_iter().enumerate() {
+                    if cand.pos1 + REF_LEN <= genome_len && cand.pos2 + REF_LEN <= genome_len {
+                        // Assembles tasks on the stack directly as [mate1, mate2]
+                        let [mate1, mate2] =
+                            assemble_pair_tasks(o1, o2, &cand, &ctx, genome, cand_idx);
+
+                        // Push directly into the contiguous arena: zero intermediate Vec!
+                        local_arena.extend_from_slice(&mate1.1);
+                        local_meta.push(mate1.0);
+
+                        local_arena.extend_from_slice(&mate2.1);
+                        local_meta.push(mate2.0);
+                    }
+                }
+            }
+
+            (local_arena, local_meta)
+        })
+        .collect(); // Simple flat collection of 32 items. Zero LinkedList / SpinLatch!
+
+    // 3. Fast bulk concatenation of chunk buffers
+    let total_tasks: usize = chunk_results.iter().map(|(_, m)| m.len()).sum();
+    let mut task_arena = Vec::with_capacity(total_tasks * 24);
+    let mut meta_list = Vec::with_capacity(total_tasks);
+
+    for (mut arena, mut metas) in chunk_results {
+        task_arena.append(&mut arena);
+        meta_list.append(&mut metas);
     }
 
     let compute_chunk = ComputeChunk {
         task_arena,
         task_count: meta_list.len(),
-        id_range: start_id..start_id + num_seq as u64,
     };
 
-    // Забираем chunk.data целиком с собой для Райтера!
-    let write_batch = WriteBatch::Single(SingleWriteBatch {
-        raw_data: chunk.data,
+    let write_batch = WriteBatch::Paired(PairedWriteBatch {
+        raw_data1: chunk1.data,
+        raw_data2: chunk2.data,
         meta: meta_list,
-        id_range: start_id..start_id + num_seq as u64,
     });
 
-    *base_read_id += num_seq as u64;
+    *base_read_id += num_pairs as u64;
 
     (write_batch, compute_chunk)
 }
 
-const MAX_CANDIDATE_PAIRS: usize = 3;
+/// Evaluation context containing precomputed sequence slices and reverse complements.
+pub struct PairAlignmentContext<'a> {
+    pub r1_raw: &'a [u8],
+    pub r2_raw: &'a [u8],
+    pub r2_rev: Vec<u8>,
+    pub r1_rev: Option<Vec<u8>>,
+}
 
+impl<'a> PairAlignmentContext<'a> {
+    /// Discovers candidate pair alignments and returns them alongside the sequence context.
+    pub fn find(
+        offset1: &SingleOffsets,
+        offset2: &SingleOffsets,
+        chunk_bytes1: &'a [u8],
+        chunk_bytes2: &'a [u8],
+        genome_len: usize,
+        index: &HashMap<u32, u32, FxBuildHasher>,
+        kmer_size: usize,
+    ) -> (Vec<CandidatePair>, Self) {
+        let r1_raw = &chunk_bytes1[offset1.seq.clone()];
+        let r2_raw = &chunk_bytes2[offset2.seq.clone()];
+        let r2_rev = reverse_complement(r2_raw);
+
+        // 1. Try standard FR orientation: R1 on (+), R2 on (-)
+        let mut r1_fwd = find_seeds(r1_raw, genome_len, index, kmer_size);
+        let mut r2_rev_seeds = find_seeds(&r2_rev, genome_len, index, kmer_size);
+
+        let mut candidates = Vec::with_capacity(MAX_CANDIDATE_PAIRS);
+
+        if !r1_fwd.is_empty() && !r2_rev_seeds.is_empty() {
+            r1_fwd.sort_unstable();
+            r2_rev_seeds.sort_unstable();
+
+            candidates.extend(
+                find_pairs_two_pointers(r1_fwd.as_slice(), r2_rev_seeds.as_slice(), true)
+                    .into_iter()
+                    .map(|(p1, p2, tlen)| CandidatePair {
+                        pos1: p1,
+                        is_rev1: false,
+                        pos2: p2,
+                        is_rev2: true,
+                        tlen,
+                    }),
+            );
+        }
+
+        // 2. Try inverted RF orientation: R1 on (-), R2 on (+) if no candidates found
+        let mut r1_rev = None;
+        let mut r1_rev_seeds = SeedHits::default();
+        let mut r2_fwd_seeds = SeedHits::default();
+
+        if candidates.is_empty() {
+            let rev1 = reverse_complement(r1_raw);
+            r1_rev_seeds = find_seeds(&rev1, genome_len, index, kmer_size);
+            r2_fwd_seeds = find_seeds(r2_raw, genome_len, index, kmer_size);
+
+            if !r1_rev_seeds.is_empty() && !r2_fwd_seeds.is_empty() {
+                r1_rev_seeds.sort_unstable();
+                r2_fwd_seeds.sort_unstable();
+
+                candidates.extend(
+                    find_pairs_two_pointers(
+                        r1_rev_seeds.as_slice(),
+                        r2_fwd_seeds.as_slice(),
+                        false,
+                    )
+                    .into_iter()
+                    .map(|(p1, p2, tlen)| CandidatePair {
+                        pos1: p1,
+                        is_rev1: true,
+                        pos2: p2,
+                        is_rev2: false,
+                        tlen,
+                    }),
+                );
+            }
+
+            r1_rev = Some(rev1);
+        }
+
+        // 3. Fallback: single-end rescue heuristic if paired discovery yielded no results
+        if candidates.is_empty() {
+            candidates = rescue_candidate(
+                r1_fwd.as_slice(),
+                r1_rev_seeds.as_slice(),
+                r2_fwd_seeds.as_slice(),
+                r2_rev_seeds.as_slice(),
+                genome_len,
+            );
+        }
+
+        let ctx = Self {
+            r1_raw,
+            r2_raw,
+            r2_rev,
+            r1_rev,
+        };
+
+        (candidates, ctx)
+    }
+}
+
+/// Identifies concordant pairs within insert size limits using a two-pointer scan.
 fn find_pairs_two_pointers(
     p1_list: &[usize],
     p2_list: &[usize],
@@ -520,15 +656,14 @@ fn find_pairs_two_pointers(
                     i += 1;
                 }
             } else {
-                // НАШЛИ ВАЛИДНУЮ ПАРУ!
-                found_pairs.push((p1, p2, tlen as i32));
+                // Concordant pair found
+                found_pairs.push((p1, p2, i32::try_from(tlen).unwrap()));
 
-                // Если уже нашли 3 альтернативных места в геноме — хватит, уходим
                 if found_pairs.len() >= MAX_CANDIDATE_PAIRS {
                     break;
                 }
 
-                // ВМЕСТО ВЫХОДА ДВИГАЕМСЯ ДАЛЬШЕ: ищем, нет ли дупликаций дальше по геному!
+                // Advance pointers to search for alternative candidate alignments
                 if r1_is_fwd {
                     i += 1;
                 } else {
@@ -541,196 +676,154 @@ fn find_pairs_two_pointers(
     found_pairs
 }
 
-fn process_paired_chunk(
-    chunk: PairChunkBuffer,
-    genome: &Arc<ReferenceGenome>,
-    index: &HashMap<u32, u32, FxBuildHasher>,
-    args: &Args,
-    base_read_id: &mut u64,
-) -> (WriteBatch, ComputeChunk) {
-    let genome_len = genome.seq.len();
-    let num_pairs = chunk.pairs.len();
-    let start_id = *base_read_id; // Копируем для потокобезопасного захвата в Rayon
-    let chunk_bytes: &[u8] = &chunk.data;
+/// Genomic candidate locations and orientations for a read pair.
+#[derive(Debug, Clone, Copy)]
+pub struct CandidatePair {
+    pub pos1: usize,
+    pub is_rev1: bool,
+    pub pos2: usize,
+    pub is_rev2: bool,
+    pub tlen: i32,
+}
 
-    let results: Vec<(PairedMeta, [u32; 24])> = chunk
-        .pairs
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(local_idx, pair)| {
-            let read_id = start_id + local_idx as u64;
-            let mut best_pairs: Vec<(usize, bool, usize, bool, i32)> = Vec::with_capacity(3);
+/// Fallback heuristic: infers missing mate coordinate when only one end anchored.
+fn rescue_candidate(
+    r1_fwd: &[usize],
+    r1_rev: &[usize],
+    r2_fwd: &[usize],
+    r2_rev: &[usize],
+    genome_len: usize,
+) -> Vec<CandidatePair> {
+    let mut rescued = Vec::with_capacity(1);
 
-            // --- ШАГ 1: FR-сценарий №1 (R1 на '+', R2 на '-') ---
-            let rev2 = reverse_complement(&chunk_bytes[pair.seq2.clone()]);
-            let mut r1_fwd = find_seeds(
-                &chunk_bytes[pair.seq1.clone()],
-                genome_len,
-                index,
-                args.kmer_size,
-            );
-            let mut r2_rev = find_seeds(&rev2, genome_len, index, args.kmer_size);
-
-            if !r1_fwd.is_empty() && !r2_rev.is_empty() {
-                r1_fwd.sort_unstable();
-                r2_rev.sort_unstable();
-                best_pairs = find_pairs_two_pointers(&r1_fwd, &r2_rev, true)
-                    .into_iter()
-                    .map(|(p1, p2, tlen)| (p1, false, p2, true, tlen))
-                    .collect();
-            }
-
-            // --- ШАГ 2: Ленивый FR-сценарий №2 (R1 на '-', R2 на '+') ---
-            let mut r1_rev = Vec::new();
-            let mut r2_fwd = Vec::new();
-            let mut lazy_rev1 = None;
-
-            if best_pairs.is_empty() {
-                let rev1 = reverse_complement(&chunk_bytes[pair.seq1.clone()]);
-                r1_rev = find_seeds(&rev1, genome_len, index, args.kmer_size);
-                r2_fwd = find_seeds(
-                    &chunk_bytes[pair.seq2.clone()],
-                    genome_len,
-                    index,
-                    args.kmer_size,
-                );
-
-                if !r1_rev.is_empty() && !r2_fwd.is_empty() {
-                    r1_rev.sort_unstable();
-                    r2_fwd.sort_unstable();
-                    best_pairs = find_pairs_two_pointers(&r1_rev, &r2_fwd, false)
-                        .into_iter()
-                        .map(|(p1, p2, tlen)| (p1, true, p2, false, tlen))
-                        .collect();
-                }
-                lazy_rev1 = Some(rev1);
-            }
-
-            // --- ШАГ 3: БЕЗОПАСНЫЙ RESCUE (Без лишних аллокаций) ---
-            if best_pairs.is_empty() {
-                if let Some(&p1) = r1_fwd.first() {
-                    let p2 = p1 + 350;
-                    if p2 + REF_LEN <= genome_len {
-                        best_pairs.push((p1, false, p2, true, 450));
-                    }
-                } else if let Some(&p1) = r1_rev.first() {
-                    let p2 = p1.saturating_sub(350);
-                    best_pairs.push((p1, true, p2, false, 450));
-                } else if let Some(&p2) = r2_fwd.first() {
-                    let p1 = p2 + 350;
-                    if p1 + REF_LEN <= genome_len {
-                        best_pairs.push((p1, true, p2, false, 450));
-                    }
-                } else if let Some(&p2) = r2_rev.first() {
-                    let p1 = p2.saturating_sub(350);
-                    best_pairs.push((p1, false, p2, true, 450));
-                }
-            }
-
-            // --- ШАГ 4: СБОРКА КАНДИДАТОВ ---
-
-            best_pairs
-                .into_iter()
-                // Фильтруем валидные границы генома прямо на лету
-                .filter(|&(p1, _, p2, _, _)| {
-                    p1 + REF_LEN <= genome_len && p2 + REF_LEN <= genome_len
-                })
-                .enumerate()
-                .flat_map(move |(x, (p1, is_rev1, p2, is_rev2, tlen))| {
-                    // --- ОБРАБОТКА R1 ---
-                    let ref_snippet_1 = &genome.seq[p1..p1 + REF_LEN];
-                    let (packed_ref_1, mask_n_ref_1) = pack_ref_stack(ref_snippet_1);
-
-                    let (packed_read_1, mask_n_read_1) = if is_rev1 {
-                        let r1_bytes =
-                            lazy_rev1.as_deref().map(Cow::Borrowed).unwrap_or_else(|| {
-                                Cow::Owned(reverse_complement(&chunk_bytes[pair.seq1.clone()]))
-                            });
-                        pack_read_stack(&r1_bytes)
-                    } else {
-                        pack_read_stack(&chunk_bytes[pair.seq1.clone()])
-                    };
-
-                    // Твой group_info (биты можно настроить под нужды GPU)
-                    let group_info_1 = (1 << 2) | (x as u32 & 3);
-                    let task_words_1 = assemble_task_words(
-                        packed_ref_1,
-                        packed_read_1,
-                        mask_n_ref_1,
-                        mask_n_read_1,
-                        group_info_1,
-                    );
-
-                    let meta1 = PairedMeta {
-                        id: read_id,
-                        name: pair.name.clone(), // Копирование Range (дешево)
-                        pos: p1 as u32,
-                        seq: pair.seq1.clone(),
-                        qual: pair.qual1.clone(),
-                        is_rev: is_rev1,
-                        is_proper: true,
-                        tlen,
-                    };
-
-                    // --- ОБРАБОТКА R2 ---
-                    let ref_snippet_2 = &genome.seq[p2..p2 + REF_LEN];
-                    let (packed_ref_2, mask_n_ref_2) = pack_ref_stack(ref_snippet_2);
-
-                    let (packed_read_2, mask_n_read_2) = if is_rev2 {
-                        pack_read_stack(&rev2)
-                    } else {
-                        pack_read_stack(&chunk_bytes[pair.seq2.clone()])
-                    };
-
-                    let group_info_2 = (1 << 2) | (x as u32 & 3);
-                    let task_words_2 = assemble_task_words(
-                        packed_ref_2,
-                        packed_read_2,
-                        mask_n_ref_2,
-                        mask_n_read_2,
-                        group_info_2,
-                    );
-
-                    let meta2 = PairedMeta {
-                        id: read_id,
-                        name: pair.name.clone(),
-                        pos: p2 as u32,
-                        seq: pair.seq2.clone(),
-                        qual: pair.qual2.clone(),
-                        is_rev: is_rev2,
-                        is_proper: true,
-                        tlen,
-                    };
-
-                    // Магия стека: возвращаем массив из двух кортежей.
-                    // Rust автоматически превратит его в итератор без аллокаций в куче!
-                    [(meta1, task_words_1), (meta2, task_words_2)]
-                })
-        })
-        .collect();
-
-    let mut task_arena = Vec::with_capacity(results.len() * 24);
-    let mut meta_list = Vec::with_capacity(results.len());
-
-    for (meta, task_words) in results {
-        task_arena.extend_from_slice(&task_words);
-        meta_list.push(meta);
+    if let Some(&p1) = r1_fwd.first() {
+        let p2 = p1 + RESCUE_OFFSET;
+        if p2 + REF_LEN <= genome_len {
+            rescued.push(CandidatePair {
+                pos1: p1,
+                is_rev1: false,
+                pos2: p2,
+                is_rev2: true,
+                tlen: RESCUE_TLEN,
+            });
+        }
+    } else if let Some(&p1) = r1_rev.first() {
+        let p2 = p1.saturating_sub(RESCUE_OFFSET);
+        rescued.push(CandidatePair {
+            pos1: p1,
+            is_rev1: true,
+            pos2: p2,
+            is_rev2: false,
+            tlen: RESCUE_TLEN,
+        });
+    } else if let Some(&p2) = r2_fwd.first() {
+        let p1 = p2 + RESCUE_OFFSET;
+        if p1 + REF_LEN <= genome_len {
+            rescued.push(CandidatePair {
+                pos1: p1,
+                is_rev1: true,
+                pos2: p2,
+                is_rev2: false,
+                tlen: RESCUE_TLEN,
+            });
+        }
+    } else if let Some(&p2) = r2_rev.first() {
+        let p1 = p2.saturating_sub(RESCUE_OFFSET);
+        rescued.push(CandidatePair {
+            pos1: p1,
+            is_rev1: false,
+            pos2: p2,
+            is_rev2: true,
+            tlen: RESCUE_TLEN,
+        });
     }
 
-    let compute_chunk = ComputeChunk {
-        task_arena,
-        task_count: meta_list.len(),
-        id_range: start_id..start_id + num_pairs as u64,
+    rescued
+}
+
+/// Assembles paired tasks for both mates on the stack without heap allocation.
+fn assemble_pair_tasks(
+    offset1: &SingleOffsets,
+    offset2: &SingleOffsets,
+    cand: &CandidatePair,
+    ctx: &PairAlignmentContext,
+    genome: &ReferenceGenome,
+    candidate_idx: usize,
+) -> [(PairedMeta, [u32; 24]); 2] {
+    // 1. Resolve read sequence for R1 (using cached reverse complement if available)
+    let r1_bytes: Cow<[u8]> = if cand.is_rev1 {
+        ctx.r1_rev
+            .as_deref()
+            .map_or_else(|| Cow::Owned(reverse_complement(ctx.r1_raw)), Cow::Borrowed)
+    } else {
+        Cow::Borrowed(ctx.r1_raw)
     };
 
-    // Забираем chunk.data целиком с собой для Райтера!
-    let write_batch = WriteBatch::Paired(PairedWriteBatch {
-        raw_data: chunk.data,
-        meta: meta_list,
-        id_range: start_id..start_id + num_pairs as u64,
-    });
+    let mate1 = encode_mate_task(
+        offset1.name.clone(),
+        offset1.seq.clone(),
+        offset1.qual.clone(),
+        &r1_bytes,
+        cand.pos1,
+        cand.is_rev1,
+        cand.tlen,
+        candidate_idx,
+        genome,
+    );
 
-    *base_read_id += num_pairs as u64;
+    // 2. Resolve read sequence for R2
+    let r2_bytes = if cand.is_rev2 {
+        &ctx.r2_rev
+    } else {
+        ctx.r2_raw
+    };
 
-    (write_batch, compute_chunk)
+    let mate2 = encode_mate_task(
+        offset2.name.clone(),
+        offset2.seq.clone(),
+        offset2.qual.clone(),
+        r2_bytes,
+        cand.pos2,
+        cand.is_rev2,
+        cand.tlen,
+        candidate_idx,
+        genome,
+    );
+
+    [mate1, mate2]
+}
+
+/// Formats and packs one mate of an aligned pair into GPU task words and SAM metadata.
+#[allow(clippy::too_many_arguments)]
+fn encode_mate_task(
+    name: std::ops::Range<usize>,
+    seq_range: std::ops::Range<usize>,
+    qual_range: std::ops::Range<usize>,
+    read_seq: &[u8],
+    ref_pos: usize,
+    is_rev: bool,
+    tlen: i32,
+    candidate_idx: usize,
+    genome: &ReferenceGenome,
+) -> (PairedMeta, [u32; 24]) {
+    let ref_snippet = &genome.seq[ref_pos..ref_pos + REF_LEN];
+    let (packed_ref, mask_n_ref) = pack_ref_stack(ref_snippet);
+    let (packed_read, mask_n_read) = pack_read_stack(read_seq);
+
+    // Group info bits: (batch_cand_count << 2) | cand_sub_index
+    let group_info = (1 << 2) | (u32::try_from(candidate_idx).unwrap() & 3);
+    let task_words =
+        assemble_task_words(packed_ref, packed_read, mask_n_ref, mask_n_read, group_info);
+
+    let meta = PairedMeta {
+        name,
+        pos: u32::try_from(ref_pos).unwrap(),
+        seq: seq_range,
+        qual: qual_range,
+        is_rev,
+        is_proper: true,
+        tlen,
+    };
+
+    (meta, task_words)
 }

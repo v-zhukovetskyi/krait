@@ -16,323 +16,229 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://gnu.org/licenses/>.
 
+use crossbeam::channel::Sender;
+use flate2::read::MultiGzDecoder;
+use std::io::Read;
 use std::{
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader},
+    num::NonZero,
+    ops::Range,
+    path::Path,
 };
 
-use flate2::read::MultiGzDecoder;
-use std::ops::Range;
-use tokio::sync::mpsc;
+pub struct SingleOffsets {
+    pub name: Range<usize>,
+    pub seq: Range<usize>,
+    pub qual: Range<usize>,
+}
 
-pub fn open_flexible_reader(path: &str) -> BufReader<Box<dyn Read + Send>> {
-    let file = File::open(path).unwrap_or_else(|_| panic!("❌ Не удалось открыть файл: {path}"));
+pub struct FastqChunk {
+    pub data: Vec<u8>,
+    pub offsets: Vec<SingleOffsets>,
+}
 
-    if std::path::Path::new(path)
+/// Dedicated single-file FASTQ worker with bulk decompression and SIMD line parsing.
+pub fn run_single_reader(
+    path: String,
+    batch_size: usize,
+    chunk_tx: Sender<FastqChunk>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(format!(
+            "krait-reader-{}",
+            Path::new(&path).file_name().unwrap().to_string_lossy()
+        ))
+        .spawn(move || {
+            let mut reader = open_flexible_reader(&path, 2);
+
+            let mut data_size = batch_size * 220;
+            let mut offsets_size = batch_size;
+            let mut data_buffer = Vec::with_capacity(data_size);
+            let mut offsets = Vec::with_capacity(offsets_size);
+            let mut scratchpad = vec![0u8; data_size.div_ceil(10)];
+            let mut parse_cursor = 0;
+            let mut eof = false;
+
+            loop {
+                // 1. Bulk read decompressed bytes directly into data_buffer
+                while offsets.len() < batch_size && !eof {
+                    let prev_len = data_buffer.len();
+
+                    match reader.read(&mut scratchpad) {
+                        Ok(0) => {
+                            eof = true;
+                        }
+                        Ok(n) => {
+                            data_buffer.extend_from_slice(&scratchpad[..n]);
+                            // Parse records out of the newly available bytes
+                            parse_records_in_memory(
+                                &data_buffer,
+                                &mut parse_cursor,
+                                &mut offsets,
+                                batch_size,
+                            );
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                            data_buffer.truncate(prev_len);
+                        }
+                        Err(e) => panic!("Decompression read error in {path}: {e}"),
+                    }
+                }
+
+                if offsets.is_empty() && eof {
+                    break; // Normal EOF reached
+                }
+
+                // 2. We have accumulated a full batch of records (or reached final EOF)
+                let records_in_batch = offsets.len().min(batch_size);
+
+                // End of the last full record in this batch
+                let cutoff_byte = if records_in_batch > 0 {
+                    offsets[records_in_batch - 1].qual.end + 1 // +1 skips the trailing '\n'
+                } else {
+                    0
+                };
+
+                data_size = data_size.max(cutoff_byte);
+                offsets_size = offsets_size.max(offsets.len());
+
+                // 3. Extract the leftover unparsed tail for the next chunk
+                let mut leftover = Vec::with_capacity(data_size);
+                leftover.extend_from_slice(&data_buffer[cutoff_byte..]);
+                data_buffer.truncate(cutoff_byte);
+
+                // 4. Send the perfectly sized, contiguous chunk
+                let chunk = FastqChunk {
+                    data: std::mem::replace(&mut data_buffer, leftover),
+                    offsets: std::mem::replace(&mut offsets, Vec::with_capacity(offsets_size)),
+                };
+
+                if chunk_tx.send(chunk).is_err() {
+                    break;
+                }
+
+                parse_cursor = 0;
+
+                // Re-parse the leftover in the new buffer coordinates if any full lines exist
+                if !data_buffer.is_empty() {
+                    parse_records_in_memory(
+                        &data_buffer,
+                        &mut parse_cursor,
+                        &mut offsets,
+                        batch_size,
+                    );
+                }
+            }
+        })
+        .unwrap()
+}
+
+pub fn open_flexible_reader(path: &str, worker_count: usize) -> Box<dyn BufRead + Send> {
+    let file = File::open(path).unwrap_or_else(|_| panic!("Failed to open file: {path}"));
+
+    let is_gz = Path::new(path)
         .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
-    {
-        BufReader::new(Box::new(MultiGzDecoder::new(file)))
-    } else {
-        BufReader::new(Box::new(file))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz") || ext.eq_ignore_ascii_case("bgz"));
+
+    if !is_gz {
+        // Uncompressed raw FASTQ: direct buffered I/O
+        return Box::new(BufReader::with_capacity(128 * 1024, file));
+    }
+
+    // 1. Try multi-threaded BGZF reader (pure Rust via zlib-rs + rayon)
+    let buf_file = BufReader::with_capacity(128 * 1024, file);
+    let mut bgzf_reader = noodles_bgzf::io::MultithreadedReader::with_worker_count(
+        NonZero::new(worker_count).unwrap(),
+        buf_file,
+    );
+
+    // Probe the first block: if it's a valid BGZF, return it!
+    if bgzf_reader.fill_buf().is_ok() {
+        return Box::new(bgzf_reader);
+    }
+
+    // 2. Fallback: standard legacy monolithic GZIP (flate2 + zlib-rs)
+    // Reopen the file since the probe might have partially advanced the stream
+    let raw_file = File::open(path).expect("File must exist on fallback");
+    let buf_file = BufReader::with_capacity(128 * 1024, raw_file);
+    let gz_decoder = MultiGzDecoder::new(buf_file);
+
+    Box::new(BufReader::with_capacity(128 * 1024, gz_decoder))
+}
+
+/// Parses FASTQ records directly from memory using fast memchr newline scanning.
+fn parse_records_in_memory(
+    data: &[u8],
+    cursor: &mut usize,
+    offsets: &mut Vec<SingleOffsets>,
+    max_records: usize,
+) {
+    while offsets.len() < max_records {
+        let start = *cursor;
+        let rem = &data[start..];
+
+        // Line 1: Header / Name
+        let Some(nl1) = memchr::memchr(b'\n', rem) else {
+            break;
+        };
+        let name_raw = &rem[..nl1];
+        let name_clean = clean_fastq_name(name_raw);
+        let name_start = start + usize::from(name_raw.starts_with(b"@"));
+        let name_range = name_start..name_start + name_clean.len();
+
+        // Line 2: Sequence
+        let rem2 = &rem[nl1 + 1..];
+        let Some(nl2) = memchr::memchr(b'\n', rem2) else {
+            break;
+        };
+        let seq_len = trim_trailing_cr(&rem2[..nl2]).len();
+        let seq_start = start + nl1 + 1;
+        let seq_range = seq_start..seq_start + seq_len;
+
+        // Line 3: '+' Separator (skip line)
+        let rem3 = &rem2[nl2 + 1..];
+        let Some(nl3) = memchr::memchr(b'\n', rem3) else {
+            break;
+        };
+
+        // Line 4: Quality
+        let rem4 = &rem3[nl3 + 1..];
+        let Some(nl4) = memchr::memchr(b'\n', rem4) else {
+            break;
+        };
+        let qual_len = trim_trailing_cr(&rem4[..nl4]).len();
+        let qual_start = start + nl1 + 1 + nl2 + 1 + nl3 + 1;
+        let qual_range = qual_start..qual_start + qual_len;
+
+        // Advance cursor past the 4th newline
+        *cursor = qual_start + nl4 + 1;
+
+        offsets.push(SingleOffsets {
+            name: name_range,
+            seq: seq_range,
+            qual: qual_range,
+        });
     }
 }
 
-pub struct SingleOffsets {
-    pub name: std::ops::Range<usize>,
-    pub seq: std::ops::Range<usize>,
-    pub qual: std::ops::Range<usize>,
-}
-
-// Единый буфер батча
-pub struct SingleChunkBuffer {
-    pub data: Vec<u8>,
-    pub single: Vec<SingleOffsets>,
-}
-
-// Легковесная структура координат для пары ридов
-pub struct PairOffsets {
-    pub name: std::ops::Range<usize>,
-    pub seq1: std::ops::Range<usize>,
-    pub qual1: std::ops::Range<usize>,
-    pub seq2: std::ops::Range<usize>,
-    pub qual2: std::ops::Range<usize>,
-}
-
-// Единый буфер батча
-pub struct PairChunkBuffer {
-    pub data: Vec<u8>,
-    pub pairs: Vec<PairOffsets>,
-}
-
-pub enum ChunkBuffer {
-    Single(SingleChunkBuffer),
-    Paired(PairChunkBuffer),
-}
-
-fn trim_newline_slice(mut s: &[u8]) -> &[u8] {
-    // Пока срез не пустой и заканчивается на перенос строки — уменьшаем его длину
+fn trim_trailing_cr(mut s: &[u8]) -> &[u8] {
     while !s.is_empty() && (s[s.len() - 1] == b'\n' || s[s.len() - 1] == b'\r') {
-        s = &s[..s.len() - 1]; // Сужаем срез с конца на 1 байт
+        s = &s[..s.len() - 1];
     }
     s
 }
 
 fn clean_fastq_name(mut name: &[u8]) -> &[u8] {
-    // 1. Отрезаем @ в начале (просто сдвигаем указатель начала среза на 1 байт вперед)
+    name = trim_trailing_cr(name);
     if name.starts_with(b"@") {
         name = &name[1..];
     }
-
-    // 2. Отрезаем пробелы и метаданные (сужаем срез до позиции пробела)
-    if let Some(pos) = name.iter().position(|&b| b == b' ' || b == b'\t') {
+    if let Some(pos) = memchr::memchr2(b' ', b'\t', name) {
         name = &name[..pos];
     }
-
-    // 3. Отрезаем суффиксы "/1" или "/2" на конце (сужаем срез с конца)
     if name.ends_with(b"/1") || name.ends_with(b"/2") {
         name = &name[..name.len() - 2];
     }
-
     name
-}
-
-fn read_name(reader: &mut impl BufRead, buffer: &mut Vec<u8>) -> Range<usize> {
-    let start_pos = buffer.len();
-    let res = reader.read_until(b'\n', buffer).unwrap();
-    if res == 0 {
-        return 0..0; // EOF
-    }
-    let end_pos = buffer.len();
-
-    let raw = &buffer[start_pos..end_pos];
-    let trimmed = trim_newline_slice(raw);
-    let cleaned = clean_fastq_name(trimmed);
-
-    // Смещение начала (если отрезали '@'):
-    let front_offset = if trimmed.starts_with(b"@") { 1 } else { 0 };
-    let clean_start = start_pos + front_offset;
-    let clean_end = clean_start + cleaned.len();
-
-    clean_start..clean_end
-}
-
-fn read_seq(reader: &mut impl BufRead, buffer: &mut Vec<u8>) -> Range<usize> {
-    let start_pos = buffer.len();
-    reader.read_until(b'\n', buffer).unwrap();
-    let end_pos = buffer.len();
-
-    let clean_len = trim_newline_slice(&buffer[start_pos..end_pos]).len();
-    start_pos..(start_pos + clean_len)
-}
-
-/// Пропускает ровно одну строку (разделитель '+') вообще без копирования байт
-fn skip_line(reader: &mut impl BufRead) -> bool {
-    let available_bytes = reader.fill_buf().unwrap();
-
-    // Если внутренний буфер пуст — мы гарантированно дошли до конца файла (EOF)
-    if available_bytes.is_empty() {
-        return false;
-    }
-
-    if let Some(pos) = available_bytes.iter().position(|&b| b == b'\n') {
-        let bytes_to_consume = pos + 1;
-        reader.consume(bytes_to_consume);
-        true
-    } else {
-        // Если строка оказалась длиннее, чем внутренний буфер ридера,
-        // или файл оборвался без \n на конце
-        let mut fallback = Vec::new();
-        let bytes_read = reader.read_until(b'\n', &mut fallback).unwrap();
-
-        // Если read_until прочитал 0 байт, значит это честный EOF
-        bytes_read > 0
-    }
-}
-
-pub fn reader_task(
-    path1: String,
-    path2: Option<String>,
-    batch_size: usize,
-    chunk_tx: mpsc::Sender<ChunkBuffer>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
-        let mut r1: BufReader<Box<dyn Read + Send>> = open_flexible_reader(&path1);
-
-        // 1. Прощупываем первый рид из обоих файлов, чтобы узнать точные размеры
-        let mut first_r1_bytes = Vec::with_capacity(2048);
-
-        // Считываем по 4 строки для определения размера
-        let r1_name = read_name(&mut r1, &mut first_r1_bytes);
-        if r1_name.is_empty() {
-            return;
-        } // Честный конец файла
-        let r1_seq = read_seq(&mut r1, &mut first_r1_bytes);
-        if !skip_line(&mut r1) {
-            return;
-        };
-        let r1_qual = read_seq(&mut r1, &mut first_r1_bytes);
-
-        if let Some(p2) = path2 {
-            println!("📦 [Reader] Режим: Paired-End...");
-
-            let mut r2 = open_flexible_reader(&p2);
-            let mut first_r2_bytes = Vec::with_capacity(2048);
-
-            if !skip_line(&mut r2) {
-                eprintln!("⚠️ Внимание: Файл R2 короче, чем R1! Возможна рассинхронизация пар.");
-                return;
-            }
-            let r2_seq = read_seq(&mut r2, &mut first_r2_bytes);
-            if !skip_line(&mut r2) {
-                return;
-            }
-            let r2_qual = read_seq(&mut r2, &mut first_r2_bytes);
-
-            // Вычисляем точный размер одной пары ридов в байтах (включая все заголовки и \n)
-            // Добавляем к длине первой пары небольшой запас (например, 8 байт)
-            // на случай, если у последующих ридов заголовки будут длиннее
-            let pair_bytes_len = first_r1_bytes.len() + first_r2_bytes.len() + 8;
-
-            // Идеальный размер буфера под данные всего батча
-            let data_capacity = pair_bytes_len * batch_size;
-
-            // Создаем первый чанк и сразу копируем туда данные первого рида, которые мы уже считали
-            let mut current_chunk = PairChunkBuffer {
-                data: Vec::with_capacity(data_capacity),
-                pairs: Vec::with_capacity(batch_size),
-            };
-
-            // Переносим байты первого рида в основной буфер
-            current_chunk.data.extend_from_slice(&first_r1_bytes);
-            current_chunk.data.extend_from_slice(&first_r2_bytes);
-
-            let r1_bytes_len = first_r1_bytes.len();
-
-            current_chunk.pairs.push(PairOffsets {
-                name: r1_name,
-                seq1: r1_seq,
-                qual1: r1_qual,
-                seq2: (r2_seq.start + r1_bytes_len)..(r2_seq.end + r1_bytes_len),
-                qual2: (r2_qual.start + r1_bytes_len)..(r2_qual.end + r1_bytes_len),
-            });
-
-            // Переиспользуемая функция/замыкание для создания нового чанка с точно рассчитанной емкостью
-            let make_new_chunk = || PairChunkBuffer {
-                data: Vec::with_capacity(data_capacity),
-                pairs: Vec::with_capacity(batch_size),
-            };
-
-            loop {
-                // Читаем R1
-                let name_range = read_name(&mut r1, &mut current_chunk.data);
-                if name_range.is_empty() {
-                    break;
-                } // Честный конец файла
-
-                let seq1_range = read_seq(&mut r1, &mut current_chunk.data);
-                if !skip_line(&mut r1) {
-                    break;
-                } // Защита: файл оборвался на строке '+'
-                let qual1_range = read_seq(&mut r1, &mut current_chunk.data);
-
-                // Читаем R2
-                if !skip_line(&mut r2) {
-                    eprintln!(
-                        "⚠️ Внимание: Файл R2 короче, чем R1! Возможна рассинхронизация пар."
-                    );
-                    break;
-                } // Защита: файл R2 закончился раньше времени!
-                let seq2_range = read_seq(&mut r2, &mut current_chunk.data);
-                if !skip_line(&mut r2) {
-                    break;
-                }
-                let qual2_range = read_seq(&mut r2, &mut current_chunk.data);
-
-                // Записываем точечные координаты (убирая служебные \n и символы @ / + при желании)
-                current_chunk.pairs.push(PairOffsets {
-                    name: name_range,
-                    seq1: seq1_range,
-                    qual1: qual1_range,
-                    seq2: seq2_range,
-                    qual2: qual2_range,
-                });
-
-                if current_chunk.pairs.len() == batch_size {
-                    // Подменяем заполненный чанк новым, у которого емкость выставлена ИДЕАЛЬНО
-                    let full_chunk = std::mem::replace(&mut current_chunk, make_new_chunk());
-                    if chunk_tx
-                        .blocking_send(ChunkBuffer::Paired(full_chunk))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-            if !current_chunk.pairs.is_empty() {
-                let _ = chunk_tx.blocking_send(ChunkBuffer::Paired(current_chunk));
-            }
-        } else {
-            println!("📦 [Reader] Режим: Single-End...");
-
-            // Идеальный размер буфера под данные всего батча
-            let data_capacity = batch_size * (first_r1_bytes.len() + 8);
-
-            // Создаем первый чанк и сразу копируем туда данные первого рида, которые мы уже считали
-            let mut current_chunk = SingleChunkBuffer {
-                data: Vec::with_capacity(data_capacity),
-                single: Vec::with_capacity(batch_size),
-            };
-
-            // Переносим байты первого рида в основной буфер
-            current_chunk.data.extend_from_slice(&first_r1_bytes);
-
-            current_chunk.single.push(SingleOffsets {
-                name: r1_name,
-                seq: r1_seq,
-                qual: r1_qual,
-            });
-
-            // Переиспользуемая функция/замыкание для создания нового чанка с точно рассчитанной емкостью
-            let make_new_chunk = || SingleChunkBuffer {
-                data: Vec::with_capacity(data_capacity),
-                single: Vec::with_capacity(batch_size),
-            };
-
-            loop {
-                // Читаем R1
-                let name_range = read_name(&mut r1, &mut current_chunk.data);
-                if name_range.is_empty() {
-                    break;
-                } // Честный конец файла
-
-                let seq1_range = read_seq(&mut r1, &mut current_chunk.data);
-                if !skip_line(&mut r1) {
-                    break;
-                } // Защита: файл оборвался на строке '+'
-                let qual1_range = read_seq(&mut r1, &mut current_chunk.data);
-
-                // Записываем точечные координаты (убирая служебные \n и символы @ / + при желании)
-                current_chunk.single.push(SingleOffsets {
-                    name: name_range,
-                    seq: seq1_range,
-                    qual: qual1_range,
-                });
-
-                if current_chunk.single.len() == batch_size {
-                    // Подменяем заполненный чанк новым, у которого емкость выставлена ИДЕАЛЬНО
-                    let full_chunk = std::mem::replace(&mut current_chunk, make_new_chunk());
-                    if chunk_tx
-                        .blocking_send(ChunkBuffer::Single(full_chunk))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-            if !current_chunk.single.is_empty() {
-                let _ = chunk_tx.blocking_send(ChunkBuffer::Single(current_chunk));
-            }
-        }
-    })
 }

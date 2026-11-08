@@ -18,35 +18,119 @@
 
 use clap::Parser;
 
+/// Fast GPU-accelerated short-read DNA sequence aligner.
 #[derive(Parser, Debug, Clone)]
-#[command(author = "Твое Имя", version = "1.0", about, long_about = None)]
+#[command(
+    name = "krait",
+    author,
+    version = "0.1",
+    about = "High-performance GPU-accelerated short-read DNA aligner",
+    long_about = None
+)]
 pub struct Args {
-    #[arg(short = 'r', long)]
+    // =========================================================================
+    // Input / Output Options
+    // =========================================================================
+    #[arg(
+        short = 'r',
+        long,
+        value_name = "FASTA",
+        help_heading = "Input / Output",
+        help = "Path to reference genome file (FASTA/GZ format)"
+    )]
     pub reference: String,
 
-    /// Первый файл ридов (или единственный для Single-End)
-    #[arg(short = 'i', short_alias = '1', long = "reads")]
+    #[arg(
+        short = '1',
+        short_alias = 'i',
+        long = "reads",
+        visible_alias = "reads1",
+        value_name = "FASTQ",
+        help_heading = "Input / Output",
+        help = "Single-end or first pair (R1) FASTQ file"
+    )]
     pub reads: String,
 
-    /// Второй файл ридов для Paired-End (опционально)
-    #[arg(short = '2', long = "reads2")]
+    #[arg(
+        short = '2',
+        long = "reads2",
+        value_name = "FASTQ",
+        help_heading = "Input / Output",
+        help = "Second pair (R2) FASTQ file for paired-end mode"
+    )]
     pub reads2: Option<String>,
 
-    #[arg(short = 'o', long, default_value = "alignment.sam")]
+    #[arg(
+        short = 'o',
+        long,
+        default_value = "alignment.sam",
+        value_name = "FILE",
+        help_heading = "Input / Output",
+        help = "Output alignment file path"
+    )]
     pub output: String,
 
-    #[arg(short = 'b', long, default_value_t = 100_000)]
-    pub batch_size: usize,
-
-    #[arg(short = 'l', long, default_value_t = 0)]
-    pub limit: u64,
-
-    #[arg(short = 'p', long)]
-    pub progress: bool,
-
-    #[arg(short = 'k', long, default_value_t = 15)]
+    // =========================================================================
+    // Algorithm & Indexing Options
+    // =========================================================================
+    #[arg(
+        short = 'k',
+        long,
+        default_value_t = 15,
+        value_name = "INT",
+        help_heading = "Algorithm & Indexing",
+        help = "Length of k-mer seeds for index lookup"
+    )]
     pub kmer_size: usize,
 
-    #[arg(short = 'f', long, default_value_t = 50)]
+    #[arg(
+        short = 'f',
+        long,
+        default_value_t = 50,
+        value_name = "INT",
+        help_heading = "Algorithm & Indexing",
+        help = "Maximum occurrence frequency threshold for seed anchors"
+    )]
     pub max_freq: u32,
+
+    // =========================================================================
+    // Execution & Hardware Options
+    // =========================================================================
+    #[arg(
+        short = 't',
+        long = "threads",
+        default_value_t = 0,
+        value_name = "INT",
+        help_heading = "Execution & Performance",
+        help = "Number of CPU threads to use (0 = auto-detect all cores)"
+    )]
+    pub threads: usize,
+
+    #[arg(
+        short = 'b',
+        long,
+        default_value_t = 100_000,
+        value_name = "INT",
+        help_heading = "Execution & Performance",
+        help = "Target batch size (number of reads/pairs processed per GPU slot)"
+    )]
+    pub batch_size: usize,
+
+    #[arg(
+        short = 'l',
+        long,
+        default_value_t = 0,
+        value_name = "INT",
+        help_heading = "Execution & Performance",
+        help = "Limit total number of input reads to process (0 = unlimited)"
+    )]
+    pub limit: u64,
+
+    #[arg(
+        short = 'p',
+        long,
+        help_heading = "Execution & Performance",
+        help = "Display live terminal progress bar and throughput metrics"
+    )]
+    pub progress: bool,
 }

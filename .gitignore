@@ -10,3 +10,4 @@ flamegraph*.svg
 *.fastq.gz
 .vscode/
 perf.data*
+profile.json.gz
