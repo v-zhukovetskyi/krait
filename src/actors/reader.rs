@@ -19,6 +19,7 @@
 use crossbeam::channel::Sender;
 use flate2::read::MultiGzDecoder;
 use std::io::Read;
+use std::time::Instant;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -26,6 +27,8 @@ use std::{
     ops::Range,
     path::Path,
 };
+
+use crate::telemetry::StageMetrics;
 
 pub struct SingleOffsets {
     pub name: Range<usize>,
@@ -43,13 +46,15 @@ pub fn run_single_reader(
     path: String,
     batch_size: usize,
     chunk_tx: Sender<FastqChunk>,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<StageMetrics> {
     std::thread::Builder::new()
         .name(format!(
             "krait-reader-{}",
             Path::new(&path).file_name().unwrap().to_string_lossy()
         ))
         .spawn(move || {
+            let mut metrics = StageMetrics::default();
+            let mut t_busy = Instant::now();
             let mut reader = open_flexible_reader(&path, 2);
 
             let mut data_size = batch_size * 220;
@@ -108,11 +113,15 @@ pub fn run_single_reader(
                 leftover.extend_from_slice(&data_buffer[cutoff_byte..]);
                 data_buffer.truncate(cutoff_byte);
 
+                metrics.items += offsets.len() as u64;
                 // 4. Send the perfectly sized, contiguous chunk
                 let chunk = FastqChunk {
                     data: std::mem::replace(&mut data_buffer, leftover),
                     offsets: std::mem::replace(&mut offsets, Vec::with_capacity(offsets_size)),
                 };
+
+                metrics.busy += t_busy.elapsed();
+                t_busy = Instant::now();
 
                 if chunk_tx.send(chunk).is_err() {
                     break;
@@ -130,6 +139,7 @@ pub fn run_single_reader(
                     );
                 }
             }
+            metrics
         })
         .unwrap()
 }

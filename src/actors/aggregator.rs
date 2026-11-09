@@ -17,11 +17,12 @@
 // along with this program.  If not, see <https://gnu.org/licenses/>.
 
 use crossbeam::channel::Receiver;
-use std::ops::Range;
+use std::{ops::Range, time::Instant};
 
 use crate::{
     actors::producer::ComputeChunk,
     constants::{READ_N_MASK_WORDS, READ_WORDS, REF_N_MASK_WORDS, REF_WORDS, STRIDE},
+    telemetry::StageMetrics,
 };
 
 pub struct GpuReadyBatch {
@@ -40,13 +41,18 @@ pub fn run_aggregator_worker(
     gpu_req_rx: crossbeam::channel::Receiver<usize>,
     gpu_batch_tx: crossbeam::channel::Sender<Option<GpuReadyBatch>>,
     max_alloc_size: usize,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<StageMetrics> {
     std::thread::Builder::new()
         .name("krait-aggregator".to_string())
         .spawn(move || {
+            let mut metrics = StageMetrics::default();
             let mut state = AggregatorState::default();
 
+            let mut t_idle = Instant::now();
             while let Ok(requested_size) = gpu_req_rx.recv() {
+                metrics.idle += t_idle.elapsed();
+                let t_busy = Instant::now();
+
                 let batch_size = requested_size.min(max_alloc_size);
                 let batch = state.assemble_batch(&producer_rx, batch_size);
                 let is_empty = batch.is_none();
@@ -58,7 +64,12 @@ pub fn run_aggregator_worker(
                 if is_empty && state.producer_finished {
                     break;
                 }
+
+                metrics.busy += t_busy.elapsed();
+                metrics.items += requested_size as u64;
+                t_idle = Instant::now();
             }
+            metrics
         })
         .unwrap()
 }

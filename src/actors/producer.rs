@@ -19,14 +19,16 @@
 use fxhash::{FxBuildHasher, FxHashMap};
 use rayon::prelude::*;
 
+use std::time::Instant;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::actors::reader::{FastqChunk, SingleOffsets};
+use crate::telemetry::StageMetrics;
 use crate::{
     cli::Args,
     constants::{
-        FLANK, MAX_CANDIDATE_PAIRS, MAX_INSERT, MIN_INSERT, READ_LEN, REF_LEN,
-        RESCUE_OFFSET, RESCUE_TLEN,
+        FLANK, MAX_CANDIDATE_PAIRS, MAX_INSERT, MIN_INSERT, READ_LEN, REF_LEN, RESCUE_OFFSET,
+        RESCUE_TLEN,
     },
 };
 pub struct SingleMeta {
@@ -114,28 +116,41 @@ pub fn run_producer_worker(
     input: ReaderInput,
     producer_tx: crossbeam::channel::Sender<ComputeChunk>,
     meta_tx: crossbeam::channel::Sender<WriteBatch>,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<StageMetrics> {
     std::thread::Builder::new()
         .name("krait-producer".to_string())
         .spawn(move || {
+            let mut metrics = StageMetrics::default();
             let index = build_kmer_index(&genome, args.kmer_size);
             let mut base_read_id = 0u64;
 
+            let mut t_idle = Instant::now();
             match input {
                 ReaderInput::Single(rx) => {
                     while let Ok(chunk) = rx.recv() {
+                        metrics.idle += t_idle.elapsed();
+                        let t_busy = Instant::now();
+                        let num_read = chunk.data.len();
+
                         let (wb, cb) =
                             process_single_chunk(chunk, &genome, &index, &args, &mut base_read_id);
                         if producer_tx.send(cb).is_err() || meta_tx.send(wb).is_err() {
                             break;
                         }
                         if args.limit > 0 && base_read_id >= args.limit {
-                            return;
+                            return metrics;
                         }
+                        metrics.busy += t_busy.elapsed();
+                        metrics.items += num_read as u64;
+                        t_idle = Instant::now();
                     }
                 }
                 ReaderInput::Paired(r1_rx, r2_rx) => {
                     while let (Ok(chunk1), Ok(chunk2)) = (r1_rx.recv(), r2_rx.recv()) {
+                        metrics.idle += t_idle.elapsed();
+                        let t_busy = Instant::now();
+                        let num_pairs = chunk1.offsets.len().min(chunk2.offsets.len());
+
                         let (wb, cb) = process_paired_chunks(
                             chunk1,
                             chunk2,
@@ -148,11 +163,16 @@ pub fn run_producer_worker(
                             break;
                         }
                         if args.limit > 0 && base_read_id >= args.limit {
-                            return;
+                            return metrics;
                         }
+
+                        metrics.busy += t_busy.elapsed();
+                        metrics.items += (num_pairs * 2) as u64;
+                        t_idle = Instant::now();
                     }
                 }
             }
+            metrics
         })
         .unwrap()
 }
@@ -161,7 +181,7 @@ fn build_kmer_index(
     genome: &Arc<ReferenceGenome>,
     kmer_size: usize,
 ) -> HashMap<u32, u32, std::hash::BuildHasherDefault<fxhash::FxHasher>> {
-    println!("[Producer] Building k-mer index (k={kmer_size})...");
+    eprintln!("[Producer] Building k-mer index (k={kmer_size})...");
     let mut index: FxHashMap<u32, u32> = FxHashMap::default();
 
     if genome.seq.len() >= kmer_size {
@@ -176,7 +196,7 @@ fn build_kmer_index(
     }
 
     index.retain(|_, &mut pos| pos != u32::MAX);
-    println!("[Producer] Index built. Unique anchors: {}", index.len());
+    eprintln!("[Producer] Index built. Unique anchors: {}", index.len());
     index
 }
 

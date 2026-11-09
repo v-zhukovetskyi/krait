@@ -20,6 +20,7 @@ mod actors;
 mod cli;
 mod constants;
 mod init_gpu;
+mod telemetry;
 
 use clap::Parser;
 use crossbeam::channel::bounded;
@@ -36,6 +37,7 @@ use crate::actors::writer::run_writer_worker;
 use crate::cli::Args;
 use crate::constants::PADDING_LEN;
 use crate::init_gpu::init_gpu;
+use crate::telemetry::print_pipeline_telemetry;
 
 fn main() {
     let total_timer = Instant::now();
@@ -54,13 +56,13 @@ fn main() {
         .build_global()
         .expect("Failed to initialize Rayon global thread pool");
 
-    println!("Threads allocated for compute: {num_threads}");
+    eprintln!("Threads allocated for compute: {num_threads}");
 
     // 3. Initialize GPU hardware context and compile WGSL pipelines
     let gpu_context = pollster::block_on(init_gpu(&args));
 
     // 4. Load and index the reference genome
-    println!("Loading reference genome from {}...", args.reference);
+    eprintln!("Loading reference genome from {}...", args.reference);
     let genome = load_reference(&args.reference);
     let genome_arc = Arc::new(genome);
 
@@ -75,7 +77,7 @@ fn main() {
     let progress_bar = init_progress_bar(args.progress);
 
     // 6. Spawn dedicated OS worker threads
-    let (mut reader_threads, producer_input) = if let Some(reads2_path) = &args.reads2 {
+    let (reader_threads, producer_input) = if let Some(reads2_path) = &args.reads2 {
         let (r1_tx, r1_rx) = crossbeam::channel::bounded(3); // Reader1 -> Producer
         let (r2_tx, r2_rx) = crossbeam::channel::bounded(3); // Reader2 -> Producer
 
@@ -117,31 +119,48 @@ fn main() {
         progress_bar.clone(),
     );
 
-    // 7. Synchronously join all OS worker threads upon pipeline completion
-    if reader_threads.len() == 2
-        && let Some(thread) = reader_threads.pop()
-    {
-        thread.join().expect("Reader2 worker thread panicked");
-    }
+    // 7. Synchronously join all OS worker threads and collect their telemetry
+    let (r1_metrics, r2_metrics) = match reader_threads.len() {
+        2 => {
+            let mut it = reader_threads.into_iter();
+            (
+                it.next().unwrap().join().unwrap(),
+                Some(it.next().unwrap().join().unwrap()),
+            )
+        }
+        1 => (
+            reader_threads.into_iter().next().unwrap().join().unwrap(),
+            None,
+        ),
+        _ => unreachable!(),
+    };
 
-    if let Some(thread) = reader_threads.pop() {
-        thread.join().expect("Reader1 worker thread panicked");
-    }
-
-    producer_thread
-        .join()
-        .expect("Producer worker thread panicked");
-    aggregator_thread
-        .join()
-        .expect("Aggregator worker thread panicked");
-    gpu_thread.join().expect("GPU worker thread panicked");
-    writer_thread.join().expect("Writer worker thread panicked");
+    let producer_metrics = producer_thread.join().expect("Producer panicked");
+    let aggregator_metrics = aggregator_thread.join().expect("Aggregator panicked");
+    let gpu_metrics = gpu_thread.join().expect("GPU worker panicked");
+    let writer_metrics = writer_thread.join().expect("Writer panicked");
 
     if args.progress {
         progress_bar.finish_with_message("Done!");
     }
 
-    println!("Total execution time: {:?}", total_timer.elapsed());
+    if args.telemetry {
+        // 8. Print high-level telemetry dashboard
+        let mut report = vec![("Reader R1", r1_metrics)];
+        if let Some(r2) = r2_metrics {
+            report.push(("Reader R2", r2));
+        }
+        report.extend_from_slice(&[
+            ("Producer (Rayon)", producer_metrics),
+            ("Aggregator (SoA)", aggregator_metrics),
+            ("GPU Worker", gpu_metrics),
+            ("Writer (Disk)", writer_metrics),
+        ]);
+
+        print_pipeline_telemetry(&report);
+    }
+
+    eprintln!("Total execution time: {:.2?}", total_timer.elapsed());
 }
 
 /// Loads a FASTA reference genome into a single contiguous byte array,

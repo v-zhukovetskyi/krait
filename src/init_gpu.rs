@@ -56,11 +56,11 @@ pub async fn init_gpu(args: &Args) -> GpuContext {
 
     let info = adapter.get_info();
     let limits = adapter.limits();
-    println!("GPU in use: [{:?}] {}", info.backend, info.name);
+    eprintln!("GPU in use: [{:?}] {}", info.backend, info.name);
 
     // 1. Calibrate maximum batch size according to driver and device constraints
     let max_size = calibrate_batch_size(&limits, info.device_type, args.batch_size);
-    println!("Calibrated max_size for GPU: {max_size} tasks per slot");
+    eprintln!("Calibrated max_size for GPU: {max_size} tasks per slot");
 
     // 2. Request logical device with calibrated storage capacities
     let dirs_buffer_size = (max_size * BYTES_PER_TASK_DIRECTIONS) as u64;

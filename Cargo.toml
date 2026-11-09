@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Valentyn Zhukovetskyi <zukovetski@gmail.com>"]
 description = "GPU-Accelerated DNA Sequence Aligner for short reads using WebGPU"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/ваш-логин/krait"
+repository = "https://github.com/v-zhukovetskyi/krait"
 
 [[bin]]
 name = "krait"
@@ -21,17 +21,13 @@ indicatif = "^0.18"
 fxhash = "^0.2"
 fearless_simd = "^1.2.0"
 
-noodles-bam = "^0.98"
+noodles-bam = "^0.91.0"
 noodles-bgzf = "^0.52"
 soa_derive = "^0.14"
 crossbeam = "^0.8"
 pollster = "^1.0"
 memchr = "2.8.3"
 
-[profile.release]
-debug = true
-
 [profile.profiling]
 inherits = "release"
 debug = true
-inline-threshold = 0

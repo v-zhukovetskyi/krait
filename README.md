@@ -1,116 +1,161 @@
-# Krait (Research Prototype)
+# Krait (banded-krait)
 
-> ⚠️ **Status: Active Research Prototype.**  
-> An experimental, cross-platform genomics alignment engine exploring how much dynamic programming throughput can be extracted from consumer and legacy hardware (CPU multi-threading + portable WebGPU compute).
+Status: Active Research Prototype.  
+An experimental, cross-platform genomics alignment engine exploring dynamic programming throughput on consumer and legacy hardware via CPU multi-threading and portable WebGPU compute.
 
-The goal of this project is to test whether low-end or older hardware (like 10-year-old laptops or integrated GPUs) can handle heavy, production-grade genomic workloads (BWA-MEM compatible affine-gap alignment) without vendor-locked ecosystems (CUDA) by leveraging **Rust** and **WebGPU/WGSL**.
-
----
-
-## Benchmark (Real-World Data)
-
-End-to-end alignment benchmark (from compressed `.fastq.gz` on disk through seeding, GPU compute, CIGAR generation, to formatted SAM output):
-
-* **Hardware:** NVIDIA GeForce GTX 960M (Mobile Maxwell, 640 CUDA cores, 2015 laptop)
-* **CPU:** Intel Core i7-5700HQ (4 cores / 8 threads @ 2.7 GHz)
-* **Dataset:** *E. coli* K-12 (~4.64 Mbp) vs. 9.82M real Illumina reads (FASTQ, paired-capable)
-* **End-to-End Wall Time:** `31.5 s`
-* **Throughput:** **~311,000 reads/sec** (~1.25 GCUPS actual banded compute / equivalent to ~4.0 GCUPS full-matrix Gotoh)
-* **Correctness:** Verified coordinates, CIGAR operations (M/I/D/S), and Phred-scaled MAPQ against standard SAM specifications.
+The purpose of this project is to evaluate whether older systems (such as legacy laptops or integrated graphics) can process high-throughput genomic workloads (BWA-MEM compatible affine-gap alignment) without vendor-locked GPU frameworks (CUDA) by using Rust and WebGPU/WGSL.
 
 ---
 
-## Key Architecture & Optimizations
+## Benchmarks
 
-The engine is built around a non-blocking asynchronous pipeline designed to keep both CPU cores and the GPU saturated simultaneously:
+### Test Setup
+* Hardware: Intel Core i7-5700HQ (4 cores / 8 threads @ 2.69 GHz under thermal constraints), NVIDIA GeForce GTX 960M (2 GB VRAM, Maxwell GM107, 640 CUDA cores)
+* Operating System: Fedora Linux 44 x86_64
+* Reference: Escherichia coli K-12 str. MG1655 (NC_000913.3, 4.64 Mbp)
+* Input Dataset: 44,928,012 paired-end Illumina reads (ERR022075, ~12 GB uncompressed)
+* Execution: Complete pipeline from compressed .fastq.gz inputs directly to disk-bound SAM format. Measured via GNU time (/usr/bin/time -v) and nvidia-smi.
+
+### Performance Comparison
+
+| Tool | Implementation | Wall Time | User Time | CPU % | Peak RAM | GPU % (Avg/Peak) | Peak VRAM |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Krait | WebGPU + 8 CPU threads | 1m 03.8s | 181.5 s | 303% | 1.37 GB | 72.8% / 100% | 716 MB |
+| minibwa | CPU (8 threads, AVX2) | 2m 43.7s | 846.3 s | 568% | 1.46 GB | N/A | N/A |
+| minimap2 (2.31) | CPU (8 threads, -ax sr) | 3m 14.8s | 1064.7 s | 562% | 0.69 GB | N/A | N/A |
+| bwa-mem2 (2.2.1) | CPU (8 threads, AVX2) | 4m 58.9s | 1918.1 s | 654% | 1.05 GB | N/A | N/A |
+| bwa-mem (0.7.19) | CPU (8 threads, scalar) | 5m 47.6s | 2338.6 s | 681% | 0.99 GB | N/A | N/A |
+
+### Concordance vs. BWA-MEM
+
+Evaluated across all 44,928,012 read pairs using read-name hash pairing against standard BWA-MEM output:
+
+| Metric | Records | Percentage |
+| :--- | :--- | :--- |
+| Total Evaluated Reads | 44,928,012 | 100.00% |
+| Concordant Placements (<= 5 bp) | 43,550,574 | 99.26% |
+| Exact Coordinate Match (0 bp difference) | 43,437,482 | 99.00% |
+| Near Match (<= 5 bp difference, gap shift) | 113,092 | 0.26% |
+| Discrepant Coordinate (> 5 bp difference, repetitive loci) | 324,562 | 0.74% |
+| False-Positive Mappings (mapped in Krait, unmapped in BWA) | 22 | 0.00% |
+
+SAM validation (samtools flagstat):
+* Total passed: 44,928,012
+* Mapped: 43,867,824 (97.64%)
+* Properly paired: 43,118,740 (95.97%)
+* Singletons: 749,084 (1.67%)
+* Secondary / Supplementary: 0 / 0
+
+---
+
+## Pipeline Architecture
+
+Krait executes as an in-order pipeline of dedicated OS threads communicating over bounded crossbeam channels:
 
 ```
-                 [ FASTQ.GZ Stream ]
-                         │
-                         ▼ 
-           (Streaming zlib decompression)
-┌────────────────────────────────────────────────────────┐
-│ CPU Producer (Rayon Parallelized):                     │
-│ • K-mer seed extraction & hash table lookup            │
-│ • Candidate locus generation (up to 3 per read)        │
-│ • Zero-allocation 2-bit & N-mask stack packing         │
-│ • Transposition into Structure-of-Arrays (SoA)         │
-└────────────────────────────────────────────────────────┘
-                         │
-                         ▼ 
-    (Asynchronous double-buffering / PCIe ping-pong)
-┌────────────────────────────────────────────────────────┐
-│ GPU Execution (wgpu / WGSL):                           │
-│ • Pass 1: Banded Gotoh DP Kernel (W = 32)              │
-│   - Sheared coordinate transformation (k = j - i)      │
-│   - In-place L1-resident 33-cell recurrence            │
-│   - 4-bit packed direction & extension flags           │
-│   - Z-drop heuristic early exit                        │
-│ • Pass 2: Traceback & CIGAR Kernel                     │
-│   - GPU-side winner pruning (losers exit in 3 cycles)  │
-│   - Perfect-match short-circuit (skips VRAM reads)     │
-│   - Finite-state-machine CIGAR reconstruction          │
-└────────────────────────────────────────────────────────┘
-                         │
-                         ▼ 
-              (Mapped staging buffers)
-┌────────────────────────────────────────────────────────┐
-│ CPU Writer Task (Rayon Worker Pool):                   │
-│ • Suboptimal score extraction & MAPQ calculation       │
-│ • Binary search contig coordinate resolution           │
-│ • Streaming SAM/BAM generation                         │
-└────────────────────────────────────────────────────────┘
+[ FASTQ.GZ Inputs ]
+   │
+   ├──────────────────────────────┐
+   ▼                              ▼
+Reader Thread R1               Reader Thread R2
+(Decompress + SIMD memchr)     (Decompress + SIMD memchr)
+   │                              │
+   └──────────────┬───────────────┘
+                  ▼
+          Producer Thread
+   (Rayon Worker Pool, coarse-grained chunks)
+   • Seed extraction & hash table lookup
+   • FR orientation resolution & mate rescue
+   • Contiguous task arena serialization
+                  │
+                  ▼
+          Aggregator Thread
+   • Column-major Structure-of-Arrays (SoA) layout
+   • Candidate family preservation across batches
+                  │
+                  ▼
+          GPU Worker Thread
+   (wgpu double-buffered ping-pong execution slots)
+   • Pass 1: Banded Gotoh DP Kernel (W = 32, sheared coords)
+   • Pass 2: Traceback & CIGAR Kernel (winner pruning)
+   • Host-visible staging readback
+                  │
+                  ▼
+          Writer Thread
+   • Zero-allocation chunked byte formatting
+   • Automated trailing soft-clip harmonization
+   • Buffered SAM v1.6 output
 ```
 
-### 1. Banded Gotoh with Sheared Coordinates ($W = 32$)
-Instead of calculating the full quadratic $100 \times 128$ matrix (12,800 cells), the kernel straightens the diagonal band into a compact $100 \times 32$ rectangle using the transform $j = i + k$.
-* Cuts cell calculations by **4x** (3,200 cells per read).
-* Reduces DP array sizes to **33 elements** (264 bytes per thread), fitting entirely within the fast on-chip L1 cache and eliminating register spilling.
-* Squeezes the global traceback directions buffer from 320 MB down to **80 MB** per batch.
+### Core Design Decisions
 
-### 2. Kernel Fission (Split DP & Traceback)
-To maximize register occupancy, dynamic programming and backtracking are split into two specialized compute pipelines executed sequentially within a single command encoder:
-* **`dp_kernel`**: Pure compute-bound matrix calculation with zero CIGAR buffer overhead.
-* **`traceback_kernel`**: Lightweight FSM traceback with zero 1000-byte DP arrays.
-* **GPU-Side Pruning**: Competing candidate loci of the same read evaluate scores in L1/L2 cache before traceback; losing candidates terminate immediately without reading VRAM directions.
+1. Synchronous OS Threading Model  
+   All stages run on dedicated OS threads (`std::thread`) connected via `crossbeam::channel::bounded`. Async runtimes are avoided in the data path to prevent executor overhead, stack-frame state-machine allocations, and CPU cache eviction across worker threads. GPU runtime initialization uses `pollster::block_on`.
 
-### 3. Asynchronous Double-Buffering (Ping-Pong)
-The GPU actor maintains two completely isolated hardware transport slots. While the GPU is computing batch $N$, the CPU is streaming batch $N+1$ across PCIe, and the writer is unmapping batch $N-1$. Hardware utilization stays balanced at ~65% CPU and ~90% GPU.
+2. Concurrent Two-Stream Decompression  
+   Paired-end inputs (R1 and R2) run in separate threads, eliminating single-core decompression bottlenecks on standard GZIP inputs. Raw byte streams are parsed in bulk blocks via SIMD `memchr`, avoiding per-line function calls.
+
+3. Banded Gotoh with Sheared Coordinates ($W = 32$)  
+   Straightens diagonal alignment sweeps into compact $100 \times 32$ matrices ($k = j - i$). Reduces DP recurrence state to 33 elements in registers and L1 cache. Cell tracebacks are stored using 4 bits per cell, packed into `vec4<u32>` per row.
+
+4. Kernel Fission with Workgroup Pruning  
+   Separates dynamic programming (`dp_kernel`) and traceback (`traceback_kernel`) into sequential compute passes within a single command encoder. Read candidate sets evaluate scores in registers; sub-optimal candidates exit immediately without reading direction matrices from VRAM.
+
+5. Dynamic WGSL Template Injection  
+   Pipeline constants (workgroup size, band size, word dimensions, scoring thresholds) are defined once in Rust and injected into shader source files at runtime via template markers, ensuring compile-time synchronization without manual synchronization.
+
+6. Zero-Allocation SAM Serialization  
+   Output generation operates on coarse-grained chunks (512 records per Rayon worker) serializing directly into raw byte buffers. Avoids intermediate heap `String` and `Vec` allocations during CIGAR generation, sequence reversal, and flag construction.
+
+---
+
+## CLI Options
+
+```
+Usage: krait [OPTIONS] -r <FASTA> -1 <FASTQ>
+
+Input / Output:
+  -r, --reference <FASTA>   Reference genome file (FASTA, optional GZ)
+  -1, -i, --reads <FASTQ>   Single-end or first-mate (R1) FASTQ file
+  -2, --reads2 <FASTQ>      Second-mate (R2) FASTQ file for paired-end mode
+  -o, --output <FILE>       Output alignment file path ('-' for stdout) [default: -]
+
+Algorithm & Indexing:
+  -k <INT>                  K-mer length for seed index [limit: 16, default: 15]
+
+Execution & Performance:
+  -b <INT>                  Target batch size for GPU slots [default: 100000]
+  -t, --threads <INT>       Worker threads for parallel tasks (0 = auto) [default: 0]
+  -l <INT>                  Read processing limit (0 = process all) [default: 0]
+  -p, --progress            Display progress and throughput metrics
+  -h, --help                Print help information
+```
 
 ---
 
 ## Roadmap
 
-- [x] Full-pipeline end-to-end streaming architecture (Tokio + Channels)
-- [x] Gotoh affine gap scoring ($M, I, D$ state model)
-- [x] Banded alignment ($W = 32$) with sheared coordinates
-- [x] 4-bit state-aware traceback encoding
-- [x] Multi-threaded zero-allocation CPU producer (Rayon)
-- [x] Two-pass kernel fission with GPU-side candidate pruning
-- [x] Multi-contig genome support with padded boundaries
-- [x] Phred MAPQ mapping quality scoring
-- [x] Valid SAM v1.6 output stream
-- [ ] Paired-End (FR orientation) support & mate rescue
-- [ ] Direct Uncompressed BAM (`uBAM`) streaming via `noodles`
-- [ ] CPU SIMD acceleration for 2-bit packing (`fearless_simd`)
-- [ ] Comprehensive error handling (replace `unwrap()` with typed errors)
-- [ ] Golden-standard differential fuzzing against BWA-MEM / samtools
+- [x] Dedicated OS thread pipeline with bounded crossbeam channels
+- [x] Multi-file concurrent decompression (R1/R2)
+- [x] Bulk FASTQ block decompression with SIMD memchr parsing
+- [x] Dual-pass WGSL compute pipeline (Banded DP + Traceback)
+- [x] Double-buffered execution slots (ping-pong)
+- [x] Illumina FR paired-end mapping with mate rescue
+- [x] Zero-allocation chunked SAM serialization
+- [x] Shared constant injection into WGSL templates
+- [ ] Replacement of k-mer hash table with minimizer index (minimap2-style)
+- [ ] Scaling index memory footprint for human reference genomes (GRCh38)
+- [ ] Dynamic MAPQ calculation based on secondary alignment score margins
+- [ ] Direct uncompressed BAM (uBAM) output streaming via noodles
+- [ ] Variable read length support across arbitrary sequencing technologies
 
 ---
 
-## Tech Stack
-
-* **Language:** Rust (2024 edition)
-* **GPU Compute:** `wgpu` (WGSL compute shaders, Vulkan / Metal / DirectX backends)
-* **Concurrency:** `tokio` (async actor pipeline), `rayon` (data-parallel CPU workers)
-* **Decompression:** `flate2` with `zlib-rs`
-* **Profiling:** `perf`, `hotspot`
-
 ## License
 
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
+This project is licensed under the GNU Affero General Public License v3.0 (AGPLv3).
 
-* Free for academic, research, and open-source use (including open-source network services).
-* If you wish to use this software in proprietary/closed-source commercial products or network services (SaaS) without AGPLv3 copyleft obligations, custom commercial licenses are available upon request. 
+* Free for academic, educational, and open-source use under AGPLv3 copyleft terms.
+* Commercial licensing without AGPLv3 copyleft requirements is available upon request.
 
-Contact: **Valentyn Zhukovetskyi** - [zukovetski@gmail.com](mailto:zukovetski@gmail.com)
+Contact: Valentyn Zhukovetskyi - zukovetski@gmail.com

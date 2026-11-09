@@ -265,7 +265,7 @@ pub fn print_dp_matrix_window(
     for j in j_range.clone() {
         print!("  {:^3}", reference[j] as char);
     }
-    println!();
+    eprintln!();
 
     for i in i_range {
         print!("{:^3} {:^2} |", read[i] as char, i);
@@ -284,7 +284,7 @@ pub fn print_dp_matrix_window(
                 print!("{symbol:^5}");
             }
         }
-        println!();
+        eprintln!();
     }
 }
 

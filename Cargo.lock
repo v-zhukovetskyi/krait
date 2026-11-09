@@ -101,7 +101,7 @@ dependencies = [
  "indicatif",
  "memchr",
  "noodles-bam",
- "noodles-bgzf",
+ "noodles-bgzf 0.52.0",
  "pollster",
  "rayon",
  "soa_derive",
@@ -114,7 +114,7 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d"
 dependencies = [
- "bit-vec 0.9.1",
+ "bit-vec",
 ]
 
 [[package]]
@@ -122,14 +122,7 @@ name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
-
-[[package]]
-name = "bit-vec"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5727b15fa97d4f4fee0a3b7c3d550ed0269f54329207b86388de918604e31269"
 dependencies = [
- "borsh",
  "serde",
 ]
 
@@ -146,30 +139,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2",
-]
-
-[[package]]
-name = "borsh"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
-dependencies = [
- "borsh-derive",
- "bytes",
- "cfg_aliases",
-]
-
-[[package]]
-name = "borsh-derive"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
-dependencies = [
- "once_cell",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 3.0.9",
 ]
 
 [[package]]
@@ -787,17 +756,29 @@ dependencies = [
 
 [[package]]
 name = "noodles-bam"
-version = "0.98.0"
+version = "0.91.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9695fd6594a78ecfaaa0c2c365412fed0f69388479504a588a6ba330db82923e"
+checksum = "68aa8af90e253005bbb957a589da61d8966ea1453bb3c1122d53704ddaa5e93c"
 dependencies = [
  "bstr",
  "indexmap",
  "memchr",
- "noodles-bgzf",
+ "noodles-bgzf 0.48.0",
  "noodles-core",
  "noodles-csi",
  "noodles-sam",
+]
+
+[[package]]
+name = "noodles-bgzf"
+version = "0.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da1dbf501b46281ca402b458211653bc8c510ea605400a1192d272a35360aa54"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "rayon",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -814,38 +795,38 @@ dependencies = [
 
 [[package]]
 name = "noodles-core"
-version = "0.21.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d99b2bca1b3816b186b4c10ab067a8a9d8331542c14cbd16f10c32dee345bc6a"
+checksum = "c8dbac7c5f9a7de9fe45590f198a09697df631cd13d2060b4742cc48144555b0"
 dependencies = [
  "bstr",
 ]
 
 [[package]]
 name = "noodles-csi"
-version = "0.62.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a08a8df410c420e7282328537e003de1bf4d88f45de891e7acfd2be80171a33"
+checksum = "56d2b47cd56d466c6b39d7d2d3f19905c786d5bbcf45c782af3c206129bb39b8"
 dependencies = [
- "bit-vec 0.10.1",
+ "bit-vec",
  "bstr",
  "indexmap",
- "noodles-bgzf",
+ "noodles-bgzf 0.48.0",
  "noodles-core",
 ]
 
 [[package]]
 name = "noodles-sam"
-version = "0.93.0"
+version = "0.86.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a562af0b8f8e82a939fa4ce311cdddea95cf7f265917e474d75ba0827e09a9a"
+checksum = "2553a62c2a78d87686005327f2597a765ae55e10e2fd09015a54c0337676fbae"
 dependencies = [
  "bitflags",
  "bstr",
  "indexmap",
  "lexical-core",
  "memchr",
- "noodles-bgzf",
+ "noodles-bgzf 0.48.0",
  "noodles-core",
  "noodles-csi",
 ]
@@ -1034,15 +1015,6 @@ name = "presser"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
-
-[[package]]
-name = "proc-macro-crate"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
-dependencies = [
- "toml_edit",
-]
 
 [[package]]
 name = "proc-macro2"
@@ -1306,36 +1278,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml_datetime"
-version = "1.1.2+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "toml_edit"
-version = "0.25.17+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c"
-dependencies = [
- "indexmap",
- "toml_datetime",
- "toml_parser",
- "winnow",
-]
-
-[[package]]
-name = "toml_parser"
-version = "1.1.5+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
-dependencies = [
- "winnow",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1490,7 +1432,7 @@ checksum = "14c018fce9b6270aa203c2fdd56f3cce996713534bd757e4ea58c8560b121f14"
 dependencies = [
  "arrayvec",
  "bit-set",
- "bit-vec 0.9.1",
+ "bit-vec",
  "bitflags",
  "bytemuck",
  "cfg_aliases",
@@ -1751,15 +1693,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "winnow"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-dependencies = [
- "memchr",
 ]
 
 [[package]]

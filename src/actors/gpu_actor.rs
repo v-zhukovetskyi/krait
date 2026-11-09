@@ -22,6 +22,7 @@ use crate::{
     actors::{aggregator::GpuReadyBatch, writer::ScoreBatch},
     constants::{CIGAR_CAPACITY, READ_LEN, REF_LEN, SCORES_PER_READ, WORKGROUP_SIZE},
     init_gpu::{Gpu, GpuParams, GpuSlot},
+    telemetry::StageMetrics,
 };
 use crossbeam::channel::{Receiver, Sender};
 
@@ -32,10 +33,11 @@ pub fn run_gpu_worker(
     gpu_batch_rx: Receiver<Option<GpuReadyBatch>>,
     score_tx: Sender<ScoreBatch>,
     max_size: usize,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<StageMetrics> {
     std::thread::Builder::new()
         .name("krait-gpu-actor".to_string())
         .spawn(move || {
+            let mut metrics = StageMetrics::default();
             let timer = Instant::now();
             let mut slot_idx = 0;
             let mut pending_batch: Option<InFlight> = None;
@@ -43,10 +45,14 @@ pub fn run_gpu_worker(
 
             // Prime the pipeline: send the initial request to the aggregator
             if gpu_req_tx.send(batch_size).is_err() {
-                return;
+                return metrics;
             }
+            let mut t_idle = Instant::now();
             // 1. Block until the aggregator delivers the prepared SoA batch
             while let Ok(Some(batch)) = gpu_batch_rx.recv() {
+                metrics.idle += t_idle.elapsed();
+                let t_busy = Instant::now();
+
                 // 2. Immediately request the NEXT batch so the aggregator works in parallel
                 let _ = gpu_req_tx.send(batch_size);
 
@@ -69,6 +75,7 @@ pub fn run_gpu_worker(
                 initiate_staging_readback(slot, scores_size, cigar_size);
 
                 // 6. Ping-Pong: wait for and drain the PREVIOUS slot while current slot runs on GPU
+
                 match flush_in_flight(&gpu, pending_batch.take(), &score_tx, &timer) {
                     Ok(Some(elapsed_ms)) => {
                         batch_size = adapt_batch_size(batch_size, elapsed_ms, max_size);
@@ -87,10 +94,16 @@ pub fn run_gpu_worker(
 
                 // Toggle ping-pong double-buffering slot (0 <-> 1)
                 slot_idx = 1 - slot_idx;
+
+                metrics.busy += t_busy.elapsed();
+                metrics.items += batch.count as u64;
+                t_idle = Instant::now();
             }
 
             // 7. Final drain: harvest the very last batch remaining in the pipeline
             let _ = flush_in_flight(&gpu, pending_batch.take(), &score_tx, &timer);
+
+            metrics
         })
         .unwrap()
 }

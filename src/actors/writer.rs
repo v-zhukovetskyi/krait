@@ -5,7 +5,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
+use crate::telemetry::StageMetrics;
 use crate::{
     actors::producer::{PairedMeta, ReferenceGenome, SingleMeta, WriteBatch},
     constants::{
@@ -27,12 +29,21 @@ pub fn run_writer_worker(
     meta_rx: Receiver<WriteBatch>,
     score_rx: Receiver<ScoreBatch>,
     progress_bar: ProgressBar,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<StageMetrics> {
     std::thread::Builder::new()
         .name("krait-writer".to_string())
         .spawn(move || {
-            let file = File::create(&output_path).expect("Failed to create output SAM file");
-            let mut writer = BufWriter::with_capacity(WRITER_BUFFER_CAPACITY, file);
+            let mut metrics = StageMetrics::default();
+
+            // Select output destination: stdout or file
+            let target: Box<dyn Write + Send> = if output_path == "-" {
+                Box::new(std::io::stdout())
+            } else {
+                let file = File::create(&output_path)
+                    .unwrap_or_else(|e| panic!("Failed to create output file '{output_path}': {e}"));
+                Box::new(file)
+            };
+            let mut writer = BufWriter::with_capacity(WRITER_BUFFER_CAPACITY, target);
 
             write_sam_header(&mut writer, &genome).expect("Failed to write SAM header");
 
@@ -41,6 +52,7 @@ pub fn run_writer_worker(
             let mut cur_score: Option<BatchCursor<ScoreBatch>> = None;
 
             loop {
+                let t_idle = Instant::now();
                 // Refill exhausted cursors from crossbeam channels
                 if cur_meta.is_none() {
                     cur_meta = meta_rx.recv().ok().map(BatchCursor::new);
@@ -48,6 +60,9 @@ pub fn run_writer_worker(
                 if cur_score.is_none() {
                     cur_score = score_rx.recv().ok().map(BatchCursor::new);
                 }
+
+                metrics.idle += t_idle.elapsed();
+                let t_busy = Instant::now();
 
                 // Terminate when either stream is closed and drained
                 let (Some(meta), Some(score)) = (&mut cur_meta, &mut cur_score) else {
@@ -98,12 +113,17 @@ pub fn run_writer_worker(
                 if cur_score.as_ref().is_some_and(<BatchCursor<ScoreBatch>>::is_exhausted) {
                     cur_score = None;
                 }
+
+                metrics.busy += t_busy.elapsed();
+                metrics.items += tasks_to_process as u64;
             }
 
             let _ = writer.flush();
             if progress_bar.is_hidden() {
-                println!("📝 [Writer] File written successfully. Total reads processed: {total_processed}");
+                eprintln!("📝 [Writer] File written successfully. Total reads processed: {total_processed}");
             }
+
+            metrics
         })
         .unwrap()
 }

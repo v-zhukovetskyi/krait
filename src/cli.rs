@@ -33,7 +33,7 @@ pub struct Args {
     // =========================================================================
     #[arg(
         short = 'r',
-        long,
+        long = "reference",
         value_name = "FASTA",
         help_heading = "Input / Output",
         help = "Path to reference genome file (FASTA/GZ format)"
@@ -63,10 +63,10 @@ pub struct Args {
     #[arg(
         short = 'o',
         long,
-        default_value = "alignment.sam",
+        default_value = "-",
         value_name = "FILE",
         help_heading = "Input / Output",
-        help = "Output alignment file path"
+        help = "Output alignment file path ('-' for stdout) [default: -]"
     )]
     pub output: String,
 
@@ -79,19 +79,20 @@ pub struct Args {
         default_value_t = 15,
         value_name = "INT",
         help_heading = "Algorithm & Indexing",
-        help = "Length of k-mer seeds for index lookup"
+        help = "Length of k-mer seeds for index lookup [limit: 16]"
     )]
     pub kmer_size: usize,
 
-    #[arg(
-        short = 'f',
-        long,
-        default_value_t = 50,
-        value_name = "INT",
-        help_heading = "Algorithm & Indexing",
-        help = "Maximum occurrence frequency threshold for seed anchors"
-    )]
-    pub max_freq: u32,
+    // TODO
+    // #[arg(
+    //     short = 'f',
+    //     long = "frequency",
+    //     default_value_t = 50,
+    //     value_name = "INT",
+    //     help_heading = "Algorithm & Indexing",
+    //     help = "Maximum occurrence frequency threshold for seed anchors"
+    // )]
+    // pub max_freq: u32,
 
     // =========================================================================
     // Execution & Hardware Options
@@ -108,7 +109,7 @@ pub struct Args {
 
     #[arg(
         short = 'b',
-        long,
+        long = "batch_size",
         default_value_t = 100_000,
         value_name = "INT",
         help_heading = "Execution & Performance",
@@ -118,7 +119,7 @@ pub struct Args {
 
     #[arg(
         short = 'l',
-        long,
+        long = "limit",
         default_value_t = 0,
         value_name = "INT",
         help_heading = "Execution & Performance",
@@ -128,9 +129,17 @@ pub struct Args {
 
     #[arg(
         short = 'p',
-        long,
+        long = "progress",
         help_heading = "Execution & Performance",
         help = "Display live terminal progress bar and throughput metrics"
     )]
     pub progress: bool,
+
+    #[arg(
+        short,
+        long = "telemetry",
+        help_heading = "Execution & Performance",
+        help = "Display live terminal progress bar and throughput metrics"
+    )]
+    pub telemetry: bool,
 }
