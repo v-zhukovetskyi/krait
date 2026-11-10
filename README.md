@@ -1,12 +1,11 @@
 # Krait (banded-krait)
 
-Status: Active Research Prototype.  
-An experimental, cross-platform genomics alignment engine exploring dynamic programming throughput on consumer and legacy hardware via CPU multi-threading and portable WebGPU compute.
+Project Status (v0.1.0):
+Functional Alpha Prototype. The core WebGPU alignment engine is stable and validated on bacterial datasets. Next milestone development (minimizer indexing and human reference scaling) is conducted under private staging.
 
 The purpose of this project is to evaluate whether older systems (such as legacy laptops or integrated graphics) can process high-throughput genomic workloads (BWA-MEM compatible affine-gap alignment) without vendor-locked GPU frameworks (CUDA) by using Rust and WebGPU/WGSL.
 
 ---
-
 ## Benchmarks
 
 ### Test Setup
@@ -86,6 +85,9 @@ Reader Thread R1               Reader Thread R2
    • Automated trailing soft-clip harmonization
    • Buffered SAM v1.6 output
 ```
+
+
+## Benchmarks
 
 ### Core Design Decisions
 

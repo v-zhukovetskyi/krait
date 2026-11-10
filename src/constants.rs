@@ -37,8 +37,8 @@ pub const MIN_INSERT: usize = 100;
 pub const MAX_INSERT: usize = 800;
 
 /// Heuristic offset for rescuing an unmapped mate when only one end is anchored.
-pub const RESCUE_OFFSET: usize = 350;
-pub const RESCUE_TLEN: i32 = 450;
+pub const RESCUE_OFFSET: usize = 380;
+pub const RESCUE_TLEN: usize = 480;
 
 /// Minimum Smith-Waterman alignment score required to declare a read mapped.
 pub const MIN_MAPPED_SCORE: i32 = 200;

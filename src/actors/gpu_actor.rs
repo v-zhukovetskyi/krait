@@ -296,7 +296,7 @@ fn adapt_batch_size(current_size: usize, elapsed_ms: u128, max_size: usize) -> u
     if elapsed_ms < 20 {
         (current_size + 4096).min(max_size)
     } else if elapsed_ms > 50 {
-        ((current_size * 3 / 4) & !1).max(4096)
+        ((current_size * 3 / 4) & !1).max(8192)
     } else {
         current_size
     }

@@ -10,6 +10,7 @@ repository = "https://github.com/v-zhukovetskyi/krait"
 [[bin]]
 name = "krait"
 path = "src/main.rs"
+include = ["src/**/*", "shaders/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [dependencies]
 wgpu = "^30.0"

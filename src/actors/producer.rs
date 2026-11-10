@@ -46,7 +46,7 @@ pub struct PairedMeta {
     pub qual: std::ops::Range<usize>,
     pub is_rev: bool,
     pub is_proper: bool,
-    pub tlen: i32,
+    pub tlen: usize,
 }
 
 pub struct SingleWriteBatch {
@@ -319,7 +319,7 @@ pub fn find_seeds(
         return SeedHits::default();
     }
 
-    let seed_offsets = [0, (read_len - kmer_size) / 2, read_len - kmer_size];
+    let seed_offsets = [5, (read_len - kmer_size) / 2, read_len - kmer_size - 5];
     let mut hits = SeedHits::default();
 
     for &offset in &seed_offsets {
@@ -643,7 +643,7 @@ fn find_pairs_two_pointers(
     p1_list: &[usize],
     p2_list: &[usize],
     r1_is_fwd: bool,
-) -> Vec<(usize, usize, i32)> {
+) -> Vec<(usize, usize, usize)> {
     let mut i = 0;
     let mut j = 0;
     let mut found_pairs = Vec::with_capacity(MAX_CANDIDATE_PAIRS);
@@ -677,7 +677,7 @@ fn find_pairs_two_pointers(
                 }
             } else {
                 // Concordant pair found
-                found_pairs.push((p1, p2, i32::try_from(tlen).unwrap()));
+                found_pairs.push((p1, p2, tlen));
 
                 if found_pairs.len() >= MAX_CANDIDATE_PAIRS {
                     break;
@@ -703,7 +703,7 @@ pub struct CandidatePair {
     pub is_rev1: bool,
     pub pos2: usize,
     pub is_rev2: bool,
-    pub tlen: i32,
+    pub tlen: usize,
 }
 
 /// Fallback heuristic: infers missing mate coordinate when only one end anchored.
@@ -822,7 +822,7 @@ fn encode_mate_task(
     read_seq: &[u8],
     ref_pos: usize,
     is_rev: bool,
-    tlen: i32,
+    tlen: usize,
     candidate_idx: usize,
     genome: &ReferenceGenome,
 ) -> (PairedMeta, [u32; 24]) {

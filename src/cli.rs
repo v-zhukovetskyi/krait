@@ -23,7 +23,7 @@ use clap::Parser;
 #[command(
     name = "krait",
     author,
-    version = "0.1",
+    version = "0.1.0",
     about = "High-performance GPU-accelerated short-read DNA aligner",
     long_about = None
 )]

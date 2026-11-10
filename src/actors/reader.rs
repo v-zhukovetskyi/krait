@@ -28,6 +28,7 @@ use std::{
     path::Path,
 };
 
+use crate::constants::READ_LEN;
 use crate::telemetry::StageMetrics;
 
 pub struct SingleOffsets {
@@ -203,6 +204,11 @@ fn parse_records_in_memory(
             break;
         };
         let seq_len = trim_trailing_cr(&rem2[..nl2]).len();
+        assert!(
+            (READ_LEN..=READ_LEN + 10).contains(&seq_len),
+            "Error: Read length ({seq_len} bp) exceeds compiled maximum ({READ_LEN} bp).
+        Prototype v0.1 currently supports reads up to {READ_LEN} bp."
+        );
         let seq_start = start + nl1 + 1;
         let seq_range = seq_start..seq_start + seq_len;
 

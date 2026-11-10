@@ -442,9 +442,9 @@ fn write_paired_record(
 
     let tlen1 = if is_proper {
         if p1 <= p2 {
-            pair[0].tlen
+            i32::try_from(pair[0].tlen).unwrap()
         } else {
-            -pair[0].tlen
+            -i32::try_from(pair[0].tlen).unwrap()
         }
     } else {
         0

@@ -11,3 +11,5 @@ flamegraph*.svg
 .vscode/
 perf.data*
 profile.json.gz
+*.py
+*.sh
