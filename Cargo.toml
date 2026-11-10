@@ -7,6 +7,16 @@ description = "GPU-Accelerated DNA Sequence Aligner for short reads using WebGPU
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/v-zhukovetskyi/krait"
 
+include = [
+    "src/**/*",
+    "shaders/**/*",
+    "tests/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "SPECIFICATION.md",
+]
+
 [[bin]]
 name = "krait"
 path = "src/main.rs"
