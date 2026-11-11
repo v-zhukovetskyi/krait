@@ -1,9 +1,15 @@
 # Krait (banded-krait)
 
+[![Crates.io](https://img.shields.io/crates/v/banded-krait.svg)](https://crates.io/crates/banded-krait)
+[![License: AGPL-3.0](https://img.shields.io/crates/l/banded-krait.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 Project Status (v0.1.0):
-Functional Alpha Prototype. The core WebGPU alignment engine is stable and validated on bacterial datasets. Next milestone development (minimizer indexing and human reference scaling) is conducted under private staging.
+Functional Alpha Prototype. The core WebGPU alignment engine is stable and validated on bacterial datasets.
 
 The purpose of this project is to evaluate whether older systems (such as legacy laptops or integrated graphics) can process high-throughput genomic workloads (BWA-MEM compatible affine-gap alignment) without vendor-locked GPU frameworks (CUDA) by using Rust and WebGPU/WGSL.
+
+> **Current Prototype Scope:**  
+> The compute shaders in this release are specialized for **fixed-length 100 bp reads** (standard Illumina 2x100 PE libraries). Read lengths differing from 100 bp are currently rejected at the ingestion stage. Support for variable read lengths (dynamic binning up to 250 bp) is targeted for the next release (see Roadmap).
 
 ---
 ## Benchmarks
@@ -44,6 +50,44 @@ SAM validation (samtools flagstat):
 * Properly paired: 43,118,740 (95.97%)
 * Singletons: 749,084 (1.67%)
 * Secondary / Supplementary: 0 / 0
+
+---
+## Installation
+
+### 1. Precompiled Standalone Binaries (No Rust or CUDA Required)
+Download the latest static binary for your platform from the [**Releases Page (v0.1.0)**](https://github.com/v-zhukovetskyi/krait/releases/tag/v0.1.0):
+
+* **Linux (x86_64, static musl):** [`krait-linux-x86_64`](https://github.com/v-zhukovetskyi/krait/releases/download/v0.1.0/krait-linux-x86_64)
+* **macOS (Apple Silicon M1/M2/M3/M4):** [`krait-macos-arm64`](https://github.com/v-zhukovetskyi/krait/releases/download/v0.1.0/krait-macos-arm64)
+* **Windows (x86_64):** [`krait-windows-x86_64.exe`](https://github.com/v-zhukovetskyi/krait/releases/download/v0.1.0/krait-windows-x86_64.exe)
+
+Quick install for Linux/macOS via terminal:
+```bash
+# Linux
+curl -L -o krait https://github.com/v-zhukovetskyi/krait/releases/download/v0.1.0/krait-linux-x86_64
+chmod +x krait && sudo mv krait /usr/local/bin/
+
+# macOS (Apple Silicon)
+curl -L -o krait https://github.com/v-zhukovetskyi/krait/releases/download/v0.1.0/krait-macos-arm64
+chmod +x krait && sudo mv krait /usr/local/bin/
+```
+
+### 2. From Crates.io
+If you have the Rust toolchain installed:
+```bash
+cargo install banded-krait
+```
+
+### 3. Build from Source
+```bash
+git clone https://github.com/v-zhukovetskyi/krait.git
+cd krait
+cargo build --release
+```
+
+### System Requirements
+* **GPU Drivers:** Any modern graphics driver supporting **Vulkan** (Linux/Windows), **Metal** (macOS), or **DirectX 12**.
+* **Zero External Dependencies:** No CUDA Toolkit, no dynamic library runtime hell, and no Python/Conda environment required.
 
 ---
 
@@ -97,8 +141,8 @@ Reader Thread R1               Reader Thread R2
 2. Concurrent Two-Stream Decompression  
    Paired-end inputs (R1 and R2) run in separate threads, eliminating single-core decompression bottlenecks on standard GZIP inputs. Raw byte streams are parsed in bulk blocks via SIMD `memchr`, avoiding per-line function calls.
 
-3. Banded Gotoh with Sheared Coordinates ($W = 32$)  
-   Straightens diagonal alignment sweeps into compact $100 \times 32$ matrices ($k = j - i$). Reduces DP recurrence state to 33 elements in registers and L1 cache. Cell tracebacks are stored using 4 bits per cell, packed into `vec4<u32>` per row.
+3. Banded Gotoh with Sheared Coordinates ($W = 32$, Fixed 100 bp Tile)  
+   Straightens diagonal alignment sweeps into compact $100 \times 32$ matrices ($k = j - i$). Hardcoding the read tile height to 100 bp eliminates warp-divergent boundary branches in the hot loop, maximizes register allocation per thread, and keeps DP recurrence state strictly within 33 registers/L1 cache.
 
 4. Kernel Fission with Workgroup Pruning  
    Separates dynamic programming (`dp_kernel`) and traceback (`traceback_kernel`) into sequential compute passes within a single command encoder. Read candidate sets evaluate scores in registers; sub-optimal candidates exit immediately without reading direction matrices from VRAM.
@@ -118,8 +162,8 @@ Usage: krait [OPTIONS] -r <FASTA> -1 <FASTQ>
 
 Input / Output:
   -r, --reference <FASTA>   Reference genome file (FASTA, optional GZ)
-  -1, -i, --reads <FASTQ>   Single-end or first-mate (R1) FASTQ file
-  -2, --reads2 <FASTQ>      Second-mate (R2) FASTQ file for paired-end mode
+  -1, -i, --reads <FASTQ>   First-mate FASTQ file (currently requires fixed 100 bp reads)
+  -2, --reads2 <FASTQ>      Second-mate FASTQ file (currently requires fixed 100 bp reads)
   -o, --output <FILE>       Output alignment file path ('-' for stdout) [default: -]
 
 Algorithm & Indexing:
