@@ -54,7 +54,15 @@ SAM validation (samtools flagstat):
 ---
 ## Installation
 
-### 1. Precompiled Standalone Binaries (No Rust or CUDA Required)
+### 1. via Homebrew (macOS & Linux)
+Install the precompiled binary using the official tap:
+```bash
+brew tap v-zhukovetskyi/tap
+brew install krait
+```
+*(Or in a single command: `brew install v-zhukovetskyi/tap/krait`)*
+
+### 2. Precompiled Standalone Binaries (No Rust or CUDA Required)
 Download the latest static binary for your platform from the [**Releases Page (v0.1.0)**](https://github.com/v-zhukovetskyi/krait/releases/tag/v0.1.0):
 
 * **Linux (x86_64, static musl):** [`krait-linux-x86_64`](https://github.com/v-zhukovetskyi/krait/releases/download/v0.1.0/krait-linux-x86_64)
@@ -72,13 +80,13 @@ curl -L -o krait https://github.com/v-zhukovetskyi/krait/releases/download/v0.1.
 chmod +x krait && sudo mv krait /usr/local/bin/
 ```
 
-### 2. From Crates.io
+### 3. From Crates.io
 If you have the Rust toolchain installed:
 ```bash
 cargo install banded-krait
 ```
 
-### 3. Build from Source
+### 4. Build from Source
 ```bash
 git clone https://github.com/v-zhukovetskyi/krait.git
 cd krait
@@ -131,8 +139,6 @@ Reader Thread R1               Reader Thread R2
 ```
 
 
-## Benchmarks
-
 ### Core Design Decisions
 
 1. Synchronous OS Threading Model  
@@ -162,8 +168,8 @@ Usage: krait [OPTIONS] -r <FASTA> -1 <FASTQ>
 
 Input / Output:
   -r, --reference <FASTA>   Reference genome file (FASTA, optional GZ)
-  -1, -i, --reads <FASTQ>   First-mate FASTQ file (currently requires fixed 100 bp reads)
-  -2, --reads2 <FASTQ>      Second-mate FASTQ file (currently requires fixed 100 bp reads)
+  -1, -i, --reads <FASTQ>   Single-end or first-mate (R1) FASTQ file (currently requires fixed 100 bp reads)
+  -2, --reads2 <FASTQ>      Second-mate (R2) FASTQ file for paired-end mode (currently requires fixed 100 bp reads)
   -o, --output <FILE>       Output alignment file path ('-' for stdout) [default: -]
 
 Algorithm & Indexing:

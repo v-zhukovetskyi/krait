@@ -139,7 +139,7 @@ pub struct Args {
         short,
         long = "telemetry",
         help_heading = "Execution & Performance",
-        help = "Display live terminal progress bar and throughput metrics"
+        help = ""
     )]
     pub telemetry: bool,
 }
